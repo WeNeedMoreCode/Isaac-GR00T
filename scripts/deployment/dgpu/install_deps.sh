@@ -68,7 +68,7 @@ fi
 cd "$REPO_ROOT"
 
 echo "Running uv sync (torch==2.7.1+cu128 from pytorch-cu128 index)..."
-uv sync
+# uv sync --insecure
 
 echo "Installing package in editable mode..."
 uv pip install -e .
