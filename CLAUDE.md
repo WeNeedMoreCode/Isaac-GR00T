@@ -1,4 +1,6 @@
-# CLAUDE.md — Isaac GR00T N1.7
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project overview
 
@@ -19,11 +21,20 @@ uv sync --all-extras
 # Lint and format (uses ruff via pre-commit)
 pre-commit run --all-files
 
-# Run CPU tests
+# Run all CPU tests
 python -m pytest tests/ -m "not gpu" -v --timeout=300
 
-# Run GPU tests
+# Run all GPU tests
 python -m pytest tests/ -m gpu -v --timeout=300
+
+# Run a single test file
+python -m pytest tests/gr00t/model/test_model_forward.py -v --timeout=300
+
+# Run a single test function
+python -m pytest tests/gr00t/model/test_model_forward.py::test_model_forward -v --timeout=300
+
+# Run tests matching a keyword
+python -m pytest tests/ -k "policy" -v --timeout=300
 
 # Build package
 uv build
@@ -78,3 +89,53 @@ getting_started/    # User-facing guides and notebooks
 - **DGX Spark:** CUDA 13.0 — install via `scripts/deployment/spark/install_deps.sh`, container via `scripts/deployment/spark/Dockerfile`
 
 Each Jetson/Spark platform ships an `activate_*.sh` helper (`scripts/activate_orin.sh`, `scripts/activate_spark.sh`, `scripts/activate_thor.sh`) that exports platform-specific library paths. For dGPU, the standard `source .venv/bin/activate` is sufficient.
+
+## Architecture
+
+### Model registration pipeline
+
+The training entry point (`gr00t/experiment/experiment.py`) resolves a model class to its training pipeline via two registries:
+
+1. **Config registry** (`gr00t/configs/model/__init__.py`): Uses `register_model_config(shortname, configtype)` to collect all model config classes. It auto-discovers `.py` files in `gr00t/configs/model/` and imports them dynamically. `create_model_union_type()` builds a `typing.Union` of all registered configs for tyro CLI subcommands.
+
+2. **Pipeline registry** (`gr00t/model/registry.py`): A simple `MODEL_REGISTRY: dict[model_cfg_class, pipeline_class]`. `gr00t/model/gr00t_n1d7/setup.py` registers `Gr00tN1d7Pipeline` against `Gr00tN1d7Config` at import time.
+
+3. **Base config** (`gr00t/configs/base_config.py`): `Config` dataclass has a `model` field typed as `ModelUnionType`. At runtime `config.model._class_` identifies which pipeline class to instantiate from `MODEL_REGISTRY`.
+
+To add a new model variant, create a config class in `gr00t/configs/model/`, register it with `@register_model_config`, and create a pipeline class that calls `register_model(config_cls, pipeline_cls)`.
+
+### Embodiment tags and modality configs
+
+`EmbodimentTag` (`gr00t/data/embodiment_tags.py`) is an enum that maps robot types to string values. Tags are **case-insensitive** and can be resolved by name or value via `EmbodimentTag.resolve()`.
+
+- **Pretrain tags** (e.g. `OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT`, `XDOF`, `REAL_G1`) are baked into the base model and support zero-shot inference.
+- **Posttrain tags** (e.g. `LIBERO_PANDA`, `SIMPLER_ENV_GOOGLE`, `UNITREE_G1_SONIC`) require a finetuned checkpoint.
+- **`NEW_EMBODIMENT`** is the generic tag for custom robots. It requires a `--modality-config-path` during finetuning. Only one `NEW_EMBODIMENT` modality config may be registered per Python process.
+
+The embodiment tag determines which `modality.json` is used (state/action keys, normalization, video keys). Modality configs for known tags live in `gr00t/configs/data/embodiment_configs.py`.
+
+### Data format
+
+GR00T uses a LeRobot v2 dataset format with an extra `meta/modality.json` file:
+
+```
+dataset/
+  meta/
+    info.json
+    episodes.jsonl
+    tasks.jsonl
+    modality.json        # state/action/video key mapping
+    statistics.json      # normalization stats
+  data/chunk-000/        # parquet files
+  videos/chunk-000/      # mp4 files
+```
+
+Demo datasets are included under `demo_data/` for quick testing.
+
+## Platform notes and known issues
+
+- **`flash-attn` re-validates on every `uv run`:** This is expected uv behavior with URL-pinned wheel sources — it is not rebuilding from source. The wheel is cached locally and the check takes 2-3 seconds. Only affects x86_64.
+- **`CUDA_HOME is unset` during fine-tuning:** Run `bash scripts/deployment/dgpu/install_deps.sh` once, or manually `export CUDA_HOME=/usr/local/cuda`.
+- **CUDA 13.x (Thor, Spark):** PyTorch 2.7 pins Triton 3.3.1, which does not recognize CUDA 13. Run `uv run bash scripts/patch_triton_cuda13.sh` to fix.
+- **GB300 (sm_103):** Triton 3.3.1 does not support this architecture. `torch.compile` will fail; use eager mode or TensorRT instead.
+- **aarch64 video backend:** Only `torchcodec` is supported. `decord` and `pyav` are not supported on aarch64.
