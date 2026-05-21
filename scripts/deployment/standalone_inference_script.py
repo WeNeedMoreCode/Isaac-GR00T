@@ -86,16 +86,20 @@ def set_seed(seed: int = 0):
     random.seed(seed)
     np.random.seed(seed)
 
-    # PyTorch CPU & CUDA
+    # PyTorch CPU & accelerators
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.manual_seed_all(seed)
 
-    # Ensure deterministic CUDA ops
+    # Ensure deterministic ops
     torch.use_deterministic_algorithms(True, warn_only=True)
 
-    # For cuDNN deterministic behavior
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # For cuDNN deterministic behavior (CUDA only)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
     # PyTorch requires this to be set for some CUDA kernels
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -629,8 +633,17 @@ class ArgsConfig:
     seed: int = 42
     """Seed to use for reproducibility."""
 
+    device: str = "cuda"
+    """Device to run inference on (cuda or npu)."""
+
 
 def main(args: ArgsConfig):
+    # NPU initialization
+    if args.device.startswith("npu"):
+        import torch_npu
+
+        torch_npu.npu.set_compile_mode(jit_compile=False)
+
     # Set up logging
     logging.basicConfig(level=logging.INFO)
     logging.info("\n" + "=" * 80)
@@ -649,8 +662,8 @@ def main(args: ArgsConfig):
     set_seed(args.seed)
     logging.info("=" * 80)
 
-    if not torch.cuda.is_available():
-        logging.error("CUDA is not available. This script requires a GPU. Exiting.")
+    if not torch.cuda.is_available() and not (hasattr(torch, "npu") and torch.npu.is_available()):
+        logging.error("Neither CUDA nor NPU is available. This script requires an accelerator. Exiting.")
         sys.exit(1)
 
     # Download model checkpoint
@@ -681,7 +694,7 @@ def main(args: ArgsConfig):
     policy = Gr00tPolicy(
         embodiment_tag=args.embodiment_tag,
         model_path=local_model_path,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device=args.device,
     )
 
     # Apply inference mode

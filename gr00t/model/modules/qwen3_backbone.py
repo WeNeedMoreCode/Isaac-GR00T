@@ -63,19 +63,9 @@ class Qwen3Backbone(torch.nn.Module):
 
         # Add attention kwargs
         extra_kwargs = {}
-        if use_flash_attention:
-            try:
-                import flash_attn  # noqa: F401
-
-                extra_kwargs["attn_implementation"] = "flash_attention_2"
-            except ImportError:
-                logger.warning(
-                    "flash_attn is not installed. Falling back to sdpa attention. "
-                    "Install flash-attn for better performance: pip install flash-attn"
-                )
-                extra_kwargs["attn_implementation"] = "sdpa"
-        if load_bf16:
-            extra_kwargs["torch_dtype"] = torch.bfloat16
+        # NPU adaptation: eager attention for compatibility; float16 since bf16 is not supported
+        extra_kwargs["attn_implementation"] = "eager"
+        extra_kwargs["torch_dtype"] = torch.float16
 
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_name,

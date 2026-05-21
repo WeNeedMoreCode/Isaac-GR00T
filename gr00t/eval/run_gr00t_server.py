@@ -70,6 +70,11 @@ class ServerConfig:
 
 
 def main(config: ServerConfig):
+    if str(config.device).startswith("npu"):
+        import torch_npu
+
+        torch_npu.npu.set_compile_mode(jit_compile=False)
+
     config.embodiment_tag = EmbodimentTag.resolve(config.embodiment_tag)
     print("Starting GR00T inference server...")
     print(f"  Embodiment tag: {config.embodiment_tag}")

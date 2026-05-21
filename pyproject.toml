@@ -23,6 +23,7 @@ dependencies = [
     "termcolor==3.2.0",
     "torch==2.7.1",
     "torchvision==0.22.1",
+    "torch_npu==2.7.1.post4",
     "transformers==4.57.3",
     "tyro==0.9.17",
     "click==8.1.8",
@@ -74,14 +75,10 @@ required-environments = [
 ]
 
 [tool.uv.sources]
-torch = [
-    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
-]
-torchvision = [
-    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
-]
+# NPU: torch/torchvision/triton installed from default index (CPU/NPU wheel)
+# Remove CUDA index to avoid pulling cu128 wheels on NPU hosts
 triton = [
-    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]
 flash-attn = [
     { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp310-cp310-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.10'" },

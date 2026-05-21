@@ -96,10 +96,26 @@ class Gr00tPolicy(BasePolicy):
             embodiment_tag = EmbodimentTag.resolve(embodiment_tag)
         model_dir = Path(model_path)
 
-        # Load the pretrained model and move to target device with bfloat16 precision
+        # NPU adaptation: patch RoPE before loading backbone
+        is_npu = str(device).startswith("npu")
+        if is_npu:
+            from gr00t.model.npu_utils import patch_qwen3_rope_for_npu
+
+            patch_qwen3_rope_for_npu()
+
+        # Load the pretrained model and move to target device with float16 precision
         model = AutoModel.from_pretrained(model_dir)
         model.eval()  # Set model to evaluation mode
-        model.to(device=device, dtype=torch.bfloat16)
+        model.to(device=device, dtype=torch.float16)
+
+        # NPU adaptation: FRACTAL_NZ + torchair compile
+        if is_npu:
+            from gr00t.model.npu_utils import compile_for_npu, format_cast_to_nz
+
+            format_cast_to_nz(model)
+            compile_for_npu(model.backbone, "forward")
+            compile_for_npu(model.action_head.model, "forward")
+
         self.model = model
 
         # Load the processor for input/output transformation.
@@ -401,7 +417,7 @@ class Gr00tPolicy(BasePolicy):
 
         # Step 3: Collate processed inputs into a single batch for model
         collated_inputs = self.collate_fn(processed_inputs)
-        collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
+        collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.float16)
 
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():

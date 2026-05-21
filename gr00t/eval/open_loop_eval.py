@@ -276,6 +276,9 @@ class ArgsConfig:
     denoising_steps: int = 4
     """Number of denoising steps to use."""
 
+    device: str = "cuda"
+    """Device to run inference on (cuda or npu)."""
+
     save_plot_path: str | None = None
     """Path to save the plot to."""
 
@@ -313,7 +316,7 @@ def main(args: ArgsConfig):
         policy = Gr00tPolicy(
             embodiment_tag=args.embodiment_tag,
             model_path=local_model_path,
-            device="cuda" if torch.cuda.is_available() else "cpu",
+            device=args.device,
         )
     else:
         policy = PolicyClient(host=args.host, port=args.port)
