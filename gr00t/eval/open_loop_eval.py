@@ -13,13 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# NPU: import torch_npu before any other imports so that transfer_to_npu
-# monkey-patches torch.cuda before downstream modules cache references.
-try:
-    import torch_npu  # noqa: F401
-except ImportError:
-    pass
-
 from copy import deepcopy
 from dataclasses import dataclass, field
 import logging

@@ -23,6 +23,9 @@ This module provides the core policy classes for running Gr00t models:
 from pathlib import Path
 from typing import Any
 
+# NPU torchair compilation toggle: set to 1 to enable, 0 to disable
+syx_compile = 0
+
 import numpy as np
 import torch
 from transformers import AutoModel, AutoProcessor
@@ -106,10 +109,14 @@ class Gr00tPolicy(BasePolicy):
         # Load the pretrained model and move to target device with float16 precision
         model = AutoModel.from_pretrained(model_dir)
         model.eval()  # Set model to evaluation mode
-        model.to(device=device, dtype=torch.float16)
+        if is_npu:
+            model = model.to(device=device)
+            model = model.half()
+        else:
+            model.to(device=device, dtype=torch.float16)
 
         # NPU adaptation: FRACTAL_NZ + torchair compile
-        if is_npu:
+        if is_npu and syx_compile:
             from gr00t.model.npu_utils import compile_for_npu, format_cast_to_nz
 
             format_cast_to_nz(model)
