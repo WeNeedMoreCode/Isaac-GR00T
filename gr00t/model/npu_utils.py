@@ -140,27 +140,42 @@ class NpuVisualWrapper(nn.Module):
     """Wrap a visual backbone module so it runs on CPU while inputs/outputs stay on NPU.
 
     Qwen3-VL's visual encoder uses Conv3D which is not implemented on some Ascend
-    NPU CANN versions. This wrapper transparently moves inputs to CPU, runs the
-    visual forward, and moves outputs back to the original NPU device.
+    NPU CANN versions. The internal visual module is stored via ``object.__setattr__``
+    so that PyTorch does **not** register it as a submodule; this prevents the
+    ``.cpu()`` call from corrupting the device placement of unrelated parameters
+    (e.g. language-model embeddings).
     """
 
     def __init__(self, visual_module: nn.Module):
         super().__init__()
-        self.visual = visual_module.cpu()
-        self.visual.eval()
+        # Bypass nn.Module.__setattr__ to avoid registering visual as a submodule.
+        object.__setattr__(self, "_visual", visual_module.cpu())
+        self._visual.eval()
+
+    @property
+    def dtype(self):
+        return self._visual.dtype
+
+    def __getattr__(self, name):
+        # Proxy attribute lookups to the underlying visual module.
+        # Avoid infinite recursion for internal attributes used by nn.Module.
+        if name in ("_visual", "_modules", "_parameters", "_buffers",
+                    "_non_persistent_buffers_set", "_backward_hooks",
+                    "_forward_hooks", "_forward_pre_hooks"):
+            raise AttributeError(name)
+        return getattr(self._visual, name)
 
     def forward(self, hidden_states, grid_thw=None, **kwargs):
         original_device = hidden_states.device
-        original_dtype = hidden_states.dtype
 
         hidden_states_cpu = hidden_states.cpu()
         grid_thw_cpu = grid_thw.cpu() if grid_thw is not None else None
 
         with torch.no_grad():
             if grid_thw_cpu is not None:
-                output = self.visual(hidden_states_cpu, grid_thw=grid_thw_cpu, **kwargs)
+                output = self._visual(hidden_states_cpu, grid_thw=grid_thw_cpu, **kwargs)
             else:
-                output = self.visual(hidden_states_cpu, **kwargs)
+                output = self._visual(hidden_states_cpu, **kwargs)
 
         if isinstance(output, tuple):
             return tuple(
