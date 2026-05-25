@@ -73,7 +73,7 @@ def main(config: ServerConfig):
     if str(config.device).startswith("npu"):
         import torch_npu
 
-        torch_npu.npu.set_compile_mode(jit_compile=False)
+        # torch_npu.npu.set_compile_mode(jit_compile=False)  # Conv3D requires jit_compile=True
 
     config.embodiment_tag = EmbodimentTag.resolve(config.embodiment_tag)
     print("Starting GR00T inference server...")

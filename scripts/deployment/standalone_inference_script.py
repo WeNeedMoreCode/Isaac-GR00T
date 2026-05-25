@@ -639,10 +639,6 @@ class ArgsConfig:
 
 
 def main(args: ArgsConfig):
-    # NPU initialization
-    if args.device.startswith("npu"):
-        # torch_npu.npu.set_compile_mode(jit_compile=False)  # Conv3D requires jit_compile=True
-
     # Set up logging
     logging.basicConfig(level=logging.INFO)
     logging.info("\n" + "=" * 80)
