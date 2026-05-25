@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 # NPU torchair compilation toggle: set to 1 to enable, 0 to disable
-syx_compile = 0
+syx_compile = 1
 
 import numpy as np
 import torch
@@ -120,6 +120,8 @@ class Gr00tPolicy(BasePolicy):
                 _orig_forward = patch_embed.forward
 
                 def _selective_jit_conv3d(x):
+                    import torch_npu
+
                     torch_npu.npu.set_compile_mode(jit_compile=True)
                     try:
                         out = _orig_forward(x)
@@ -139,7 +141,9 @@ class Gr00tPolicy(BasePolicy):
             from gr00t.model.npu_utils import compile_for_npu, format_cast_to_nz
 
             format_cast_to_nz(model)
-            compile_for_npu(model.backbone, "forward")
+            # NOTE: backbone (transformers Qwen3-VL) has torch_npu setattr
+            # that Dynamo cannot trace. Skip for now.
+            # compile_for_npu(model.backbone, "forward")
             compile_for_npu(model.action_head.model, "forward")
 
         self.model = model
