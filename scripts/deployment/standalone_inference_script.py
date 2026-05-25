@@ -639,6 +639,12 @@ class ArgsConfig:
 
 
 def main(args: ArgsConfig):
+    # NPU initialization
+    if args.device.startswith("npu"):
+        import torch_npu
+
+        torch_npu.npu.set_compile_mode(jit_compile=False)
+
     # Set up logging
     logging.basicConfig(level=logging.INFO)
     logging.info("\n" + "=" * 80)

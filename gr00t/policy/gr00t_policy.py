@@ -112,7 +112,20 @@ class Gr00tPolicy(BasePolicy):
         if is_npu:
             model = model.to(device=device)
             model = model.half()
-            # NPU note: Conv3D requires jit_compile=True (default).
+            # NPU: Conv3D only works with jit_compile=True (default).
+            # We temporarily enable it to warmup the visual patch_embed,
+            # then switch back to False for faster stable inference.
+            import torch_npu
+
+            torch_npu.npu.set_compile_mode(jit_compile=True)
+            try:
+                patch_embed = model.backbone.model.model.visual.patch_embed
+                with torch.no_grad():
+                    dummy = torch.randn(1, 3, 2, 384, 384).half().to(device)
+                    _ = patch_embed(dummy)
+            except Exception:
+                pass  # Warmup is best-effort; fall through silently.
+            torch_npu.npu.set_compile_mode(jit_compile=False)
         else:
             model.to(device=device, dtype=torch.float16)
 
