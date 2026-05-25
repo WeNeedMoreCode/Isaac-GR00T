@@ -112,20 +112,25 @@ class Gr00tPolicy(BasePolicy):
         if is_npu:
             model = model.to(device=device)
             model = model.half()
-            # NPU: Conv3D only works with jit_compile=True (default).
-            # We temporarily enable it to warmup the visual patch_embed,
-            # then switch back to False for faster stable inference.
-            import torch_npu
-
-            torch_npu.npu.set_compile_mode(jit_compile=True)
+            # Conv3D lacks a precompiled kernel under jit_compile=False.
+            # Workaround: wrap patch_embed so it runs with jit_compile=True
+            # while the rest of the model stays on jit_compile=False.
             try:
                 patch_embed = model.backbone.model.model.visual.patch_embed
-                with torch.no_grad():
-                    dummy = torch.randn(1, 3, 2, 384, 384).half().to(device)
-                    _ = patch_embed(dummy)
-            except Exception:
-                pass  # Warmup is best-effort; fall through silently.
-            torch_npu.npu.set_compile_mode(jit_compile=False)
+                _orig_forward = patch_embed.forward
+
+                def _selective_jit_conv3d(x):
+                    torch_npu.npu.set_compile_mode(jit_compile=True)
+                    try:
+                        out = _orig_forward(x)
+                    finally:
+                        torch_npu.npu.set_compile_mode(jit_compile=False)
+                    return out
+
+                patch_embed.forward = _selective_jit_conv3d
+                print("[NPU] patch_embed -> selective JIT mode")
+            except Exception as e:
+                print(f"[NPU] patch_embed selective JIT failed: {e}")
         else:
             model.to(device=device, dtype=torch.float16)
 
