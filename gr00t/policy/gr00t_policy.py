@@ -112,6 +112,11 @@ class Gr00tPolicy(BasePolicy):
         if is_npu:
             model = model.to(device=device)
             model = model.half()
+            # Qwen3-VL visual backbone uses Conv3D which is unsupported on NPU;
+            # wrap it so inputs/outputs stay on NPU while the module runs on CPU.
+            from gr00t.model.npu_utils import NpuVisualWrapper
+
+            model.backbone.model.visual = NpuVisualWrapper(model.backbone.model.visual)
         else:
             model.to(device=device, dtype=torch.float16)
 

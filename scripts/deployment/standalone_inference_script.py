@@ -604,7 +604,7 @@ class ArgsConfig:
     action_horizon: int = 16
     """Action horizon to evaluate."""
 
-    video_backend: Literal["decord", "torchvision_av", "torchcodec"] = "torchcodec"
+    video_backend: Literal["decord", "torchvision_av", "torchcodec"] = "decord"
     """Video backend to use for various codec options. h264: decord or av: torchvision_av"""
 
     dataset_path: str = "demo_data/droid_sample"

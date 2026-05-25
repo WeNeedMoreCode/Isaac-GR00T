@@ -130,3 +130,43 @@ def compile_for_npu(model: nn.Module, method_name: str = "forward") -> None:
     compiled = torch.compile(original, dynamic=False, fullgraph=True, backend=npu_backend)
     setattr(model, method_name, compiled)
     logger.info(f"Compiled {model.__class__.__name__}.{method_name} with torchair")
+
+
+# ---------------------------------------------------------------------------
+# CPU fallback for unsupported NPU ops (e.g. Conv3D in Qwen3-VL visual)
+# ---------------------------------------------------------------------------
+
+class NpuVisualWrapper(nn.Module):
+    """Wrap a visual backbone module so it runs on CPU while inputs/outputs stay on NPU.
+
+    Qwen3-VL's visual encoder uses Conv3D which is not implemented on some Ascend
+    NPU CANN versions. This wrapper transparently moves inputs to CPU, runs the
+    visual forward, and moves outputs back to the original NPU device.
+    """
+
+    def __init__(self, visual_module: nn.Module):
+        super().__init__()
+        self.visual = visual_module.cpu()
+        self.visual.eval()
+
+    def forward(self, hidden_states, grid_thw=None, **kwargs):
+        original_device = hidden_states.device
+        original_dtype = hidden_states.dtype
+
+        hidden_states_cpu = hidden_states.cpu()
+        grid_thw_cpu = grid_thw.cpu() if grid_thw is not None else None
+
+        with torch.no_grad():
+            if grid_thw_cpu is not None:
+                output = self.visual(hidden_states_cpu, grid_thw=grid_thw_cpu, **kwargs)
+            else:
+                output = self.visual(hidden_states_cpu, **kwargs)
+
+        if isinstance(output, tuple):
+            return tuple(
+                o.to(original_device) if isinstance(o, torch.Tensor) else o
+                for o in output
+            )
+        elif isinstance(output, torch.Tensor):
+            return output.to(original_device)
+        return output
