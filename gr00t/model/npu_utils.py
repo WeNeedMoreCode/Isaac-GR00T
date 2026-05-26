@@ -142,17 +142,27 @@ def get_npu_backend(frozen_parameter: bool = True, tiling_optimize: bool = True)
     return tng.get_npu_backend(compiler_config=config)
 
 
-def compile_for_npu(model: nn.Module, method_name: str = "forward") -> None:
+def compile_for_npu(model: nn.Module, method_name: str = "forward", fullgraph: bool = True) -> None:
     """Replace a model method with its torchair-compiled version.
 
+    Args:
+        model: The model whose method will be compiled.
+        method_name: Name of the method to compile (default "forward").
+        fullgraph: If True, require the entire function to be traceable.
+            Set to False to allow graph breaks (e.g. for complex transformers forward).
+
     Example:
-        compile_for_npu(backbone, "forward")
+        compile_for_npu(backbone, "forward", fullgraph=False)
         compile_for_npu(action_head.model, "forward")
     """
+    import torch._dynamo
+
+    torch._dynamo.config.capture_scalar_outputs = True
+    torch._dynamo.config.capture_dynamic_output_shape_ops = True
     npu_backend = get_npu_backend()
     original = getattr(model, method_name)
-    compiled = torch.compile(original, dynamic=False, fullgraph=True, backend=npu_backend)
+    compiled = torch.compile(original, dynamic=False, fullgraph=fullgraph, backend=npu_backend)
     setattr(model, method_name, compiled)
-    logger.info(f"Compiled {model.__class__.__name__}.{method_name} with torchair")
+    logger.info(f"Compiled {model.__class__.__name__}.{method_name} with torchair (fullgraph={fullgraph})")
 
 

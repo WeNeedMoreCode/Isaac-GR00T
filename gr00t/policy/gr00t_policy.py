@@ -113,26 +113,28 @@ class Gr00tPolicy(BasePolicy):
         if is_npu:
             model = model.to(device=device, dtype=torch.float16)
             # Conv3D lacks a precompiled kernel under jit_compile=False.
-            # Workaround: wrap patch_embed so it runs with jit_compile=True
-            # while the rest of the model stays on jit_compile=False.
-            try:
-                patch_embed = model.backbone.model.model.visual.patch_embed
-                _orig_forward = patch_embed.forward
+            # When backbone is NOT compiled with torchair, we use selective JIT
+            # to wrap patch_embed. When backbone IS compiled, torchair handles
+            # Conv3D itself and selective JIT conflicts with Dynamo tracing.
+            if not syx_compile:
+                try:
+                    patch_embed = model.backbone.model.model.visual.patch_embed
+                    _orig_forward = patch_embed.forward
 
-                def _selective_jit_conv3d(x):
-                    import torch_npu
+                    def _selective_jit_conv3d(x):
+                        import torch_npu
 
-                    torch_npu.npu.set_compile_mode(jit_compile=True)
-                    try:
-                        out = _orig_forward(x)
-                    finally:
-                        torch_npu.npu.set_compile_mode(jit_compile=False)
-                    return out
+                        torch_npu.npu.set_compile_mode(jit_compile=True)
+                        try:
+                            out = _orig_forward(x)
+                        finally:
+                            torch_npu.npu.set_compile_mode(jit_compile=False)
+                        return out
 
-                patch_embed.forward = _selective_jit_conv3d
-                print("[NPU] patch_embed -> selective JIT mode")
-            except Exception as e:
-                print(f"[NPU] patch_embed selective JIT failed: {e}")
+                    patch_embed.forward = _selective_jit_conv3d
+                    print("[NPU] patch_embed -> selective JIT mode")
+                except Exception as e:
+                    print(f"[NPU] patch_embed selective JIT failed: {e}")
         else:
             model.to(device=device, dtype=torch.float16)
 
@@ -141,7 +143,7 @@ class Gr00tPolicy(BasePolicy):
             from gr00t.model.npu_utils import compile_for_npu, format_cast_to_nz
 
             format_cast_to_nz(model)
-            compile_for_npu(model.backbone, "forward")
+            compile_for_npu(model.backbone, "forward", fullgraph=False)
             compile_for_npu(model.action_head.model, "forward")
 
         self.model = model
