@@ -102,16 +102,16 @@ class Gr00tPolicy(BasePolicy):
         # NPU adaptation: patch RoPE before loading backbone
         is_npu = str(device).startswith("npu")
         if is_npu:
-            from gr00t.model.npu_utils import patch_qwen3_rope_for_npu
+            from gr00t.model.npu_utils import patch_qwen3_rope_for_npu, patch_tensor_type_for_npu
 
             patch_qwen3_rope_for_npu()
+            patch_tensor_type_for_npu()
 
         # Load the pretrained model and move to target device with float16 precision
         model = AutoModel.from_pretrained(model_dir)
         model.eval()  # Set model to evaluation mode
         if is_npu:
-            model = model.to(device=device)
-            model = model.half()
+            model = model.to(device=device, dtype=torch.float16)
             # Conv3D lacks a precompiled kernel under jit_compile=False.
             # Workaround: wrap patch_embed so it runs with jit_compile=True
             # while the rest of the model stays on jit_compile=False.
@@ -141,9 +141,7 @@ class Gr00tPolicy(BasePolicy):
             from gr00t.model.npu_utils import compile_for_npu, format_cast_to_nz
 
             format_cast_to_nz(model)
-            # NOTE: backbone (transformers Qwen3-VL) has torch_npu setattr
-            # that Dynamo cannot trace. Skip for now.
-            # compile_for_npu(model.backbone, "forward")
+            compile_for_npu(model.backbone, "forward")
             compile_for_npu(model.action_head.model, "forward")
 
         self.model = model

@@ -77,6 +77,30 @@ def patch_qwen3_rope_for_npu():
     )
 
 
+def patch_tensor_type_for_npu():
+    """Monkey-patch torch.Tensor.type to use .to(dtype=...) on NPU tensors.
+
+    torch_npu's _npu_type implementation contains class-level setattr patterns
+    that Dynamo cannot trace during torch.compile. Redirecting to .to() avoids
+    the issue. This mirrors the pi0.5 approach of replacing .type() with .to().
+    """
+    _orig_type = torch.Tensor.type
+
+    def _npu_safe_type(self, *args, **kwargs):
+        if str(self.device).startswith("npu"):
+            dtype = kwargs.get("dtype")
+            if dtype is None and args:
+                first = args[0]
+                if isinstance(first, (torch.dtype, str)):
+                    dtype = first
+            if dtype is not None:
+                return self.to(dtype=dtype)
+        return _orig_type(self, *args, **kwargs)
+
+    torch.Tensor.type = _npu_safe_type
+    logger.info("Patched torch.Tensor.type for NPU")
+
+
 # ---------------------------------------------------------------------------
 # FRACTAL_NZ weight casting
 # ---------------------------------------------------------------------------
