@@ -113,28 +113,25 @@ class Gr00tPolicy(BasePolicy):
         if is_npu:
             model = model.to(device=device, dtype=torch.float16)
             # Conv3D lacks a precompiled kernel under jit_compile=False.
-            # When backbone is NOT compiled with torchair, we use selective JIT
-            # to wrap patch_embed. When backbone IS compiled, torchair handles
-            # Conv3D itself and selective JIT conflicts with Dynamo tracing.
-            if not syx_compile:
-                try:
-                    patch_embed = model.backbone.model.model.visual.patch_embed
-                    _orig_forward = patch_embed.forward
+            # Visual encoder always runs in eager mode, so selective JIT is always needed.
+            try:
+                patch_embed = model.backbone.model.model.visual.patch_embed
+                _orig_forward = patch_embed.forward
 
-                    def _selective_jit_conv3d(x):
-                        import torch_npu
+                def _selective_jit_conv3d(x):
+                    import torch_npu
 
-                        torch_npu.npu.set_compile_mode(jit_compile=True)
-                        try:
-                            out = _orig_forward(x)
-                        finally:
-                            torch_npu.npu.set_compile_mode(jit_compile=False)
-                        return out
+                    torch_npu.npu.set_compile_mode(jit_compile=True)
+                    try:
+                        out = _orig_forward(x)
+                    finally:
+                        torch_npu.npu.set_compile_mode(jit_compile=False)
+                    return out
 
-                    patch_embed.forward = _selective_jit_conv3d
-                    print("[NPU] patch_embed -> selective JIT mode")
-                except Exception as e:
-                    print(f"[NPU] patch_embed selective JIT failed: {e}")
+                patch_embed.forward = _selective_jit_conv3d
+                print("[NPU] patch_embed -> selective JIT mode")
+            except Exception as e:
+                print(f"[NPU] patch_embed selective JIT failed: {e}")
         else:
             model.to(device=device, dtype=torch.float16)
 
