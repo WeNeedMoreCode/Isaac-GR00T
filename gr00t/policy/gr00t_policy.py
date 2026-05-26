@@ -143,7 +143,7 @@ class Gr00tPolicy(BasePolicy):
             from gr00t.model.npu_utils import compile_for_npu, format_cast_to_nz
 
             format_cast_to_nz(model)
-            compile_for_npu(model.backbone, "forward", fullgraph=False)
+            compile_for_npu(model.backbone, "_language_model_forward")
             compile_for_npu(model.action_head.model, "forward")
 
         self.model = model

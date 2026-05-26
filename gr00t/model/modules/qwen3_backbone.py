@@ -125,18 +125,75 @@ class Qwen3Backbone(torch.nn.Module):
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
+    def _preprocess_vl_input(self, vl_input: dict) -> dict:
+        """Run all data-dependent preprocessing (image encoding, embedding, position_ids).
+
+        Mirrors the first half of Qwen3VLModel.forward so that only the language_model
+        call remains for torchair compilation.
+        """
+        qwen3vl_model = self.model.model  # Qwen3VLModel
+
+        # 1. Text embedding
+        inputs_embeds = qwen3vl_model.get_input_embeddings()(vl_input["input_ids"])
+
+        # 2. Image encoding
+        pixel_values = vl_input["pixel_values"]
+        image_grid_thw = vl_input["image_grid_thw"]
+        image_embeds, deepstack_image_embeds = qwen3vl_model.get_image_features(
+            pixel_values, image_grid_thw
+        )
+        image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+
+        # 3. Scatter image embeddings into text embedding
+        image_mask = vl_input["input_ids"] == self.model.config.image_token_id
+        image_mask_expanded = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask_expanded, image_embeds)
+
+        # 4. Visual position masks and deepstack features
+        visual_pos_masks = image_mask  # [B, seq_len]
+        deepstack_visual_embeds = deepstack_image_embeds
+
+        # 5. Compute position_ids (data-dependent)
+        position_ids, rope_deltas = qwen3vl_model.get_rope_index(
+            vl_input["input_ids"],
+            image_grid_thw=image_grid_thw,
+            attention_mask=vl_input["attention_mask"],
+        )
+
+        return {
+            "input_ids": None,
+            "position_ids": position_ids,
+            "attention_mask": vl_input["attention_mask"],
+            "past_key_values": None,
+            "inputs_embeds": inputs_embeds,
+            "cache_position": None,
+            "visual_pos_masks": visual_pos_masks,
+            "deepstack_visual_embeds": deepstack_visual_embeds,
+        }
+
+    def _language_model_forward(self, **kwargs) -> torch.Tensor:
+        """Run the language model forward pass (compilable with torchair)."""
+        outputs = self.model.model.language_model(**kwargs, output_hidden_states=True)
+        return outputs.hidden_states[-1]
+
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
         # 0. Set frozen module to eval
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
-        outputs = self.model(**vl_input, output_hidden_states=True)
-        outputs = outputs.hidden_states[-1]
+
+        # Step 1: data-dependent preprocessing (eager, not compiled)
+        lm_kwargs = self._preprocess_vl_input(vl_input)
+
+        # Step 2: language model (compilable with torchair)
+        hidden_states = self._language_model_forward(**lm_kwargs)
+
+        # Step 3: output processing
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
         attention_mask = vl_input["attention_mask"] == 1
         return BatchFeature(
             data={
-                "backbone_features": outputs,
+                "backbone_features": hidden_states,
                 "backbone_attention_mask": attention_mask,
                 "image_mask": image_mask,
             }
