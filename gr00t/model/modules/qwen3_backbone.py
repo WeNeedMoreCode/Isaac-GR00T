@@ -135,6 +135,7 @@ class Qwen3Backbone(torch.nn.Module):
 
         # 1. Text embedding
         inputs_embeds = qwen3vl_model.get_input_embeddings()(vl_input["input_ids"])
+        print(f"[CHK1] inputs_embeds: shape={inputs_embeds.shape}, mean={inputs_embeds.mean():.6f}, std={inputs_embeds.std():.6f}")
 
         # 2. Image encoding
         pixel_values = vl_input["pixel_values"]
@@ -143,15 +144,20 @@ class Qwen3Backbone(torch.nn.Module):
             pixel_values, image_grid_thw
         )
         image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+        print(f"[CHK2] image_embeds: shape={image_embeds.shape}, mean={image_embeds.mean():.6f}, std={image_embeds.std():.6f}")
 
         # 3. Scatter image embeddings into text embedding
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
         image_mask_expanded = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         inputs_embeds = inputs_embeds.masked_scatter(image_mask_expanded, image_embeds)
+        print(f"[CHK3] inputs_embeds after scatter: shape={inputs_embeds.shape}, mean={inputs_embeds.mean():.6f}, std={inputs_embeds.std():.6f}")
 
         # 4. Visual position masks and deepstack features
         visual_pos_masks = image_mask  # [B, seq_len]
         deepstack_visual_embeds = deepstack_image_embeds
+        print(f"[CHK4] visual_pos_masks: shape={visual_pos_masks.shape}, sum={visual_pos_masks.sum()}")
+        if deepstack_visual_embeds:
+            print(f"[CHK4] deepstack count={len(deepstack_visual_embeds)}, shape[0]={deepstack_visual_embeds[0].shape}")
 
         # 5. Compute position_ids (data-dependent)
         position_ids, rope_deltas = qwen3vl_model.get_rope_index(
@@ -159,6 +165,7 @@ class Qwen3Backbone(torch.nn.Module):
             image_grid_thw=image_grid_thw,
             attention_mask=vl_input["attention_mask"],
         )
+        print(f"[CHK5] position_ids: shape={position_ids.shape}, dtype={position_ids.dtype}")
 
         return {
             "input_ids": None,
@@ -181,6 +188,25 @@ class Qwen3Backbone(torch.nn.Module):
         # 0. Set frozen module to eval
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
+
+        # --- DEBUG: compare original vs split path ---
+        with torch.no_grad():
+            # Original path (reference)
+            ref_outputs = self.model(**vl_input, output_hidden_states=True)
+            ref_hidden = ref_outputs.hidden_states[-1]
+            # Also get the original language_model inputs for comparison
+            ref_qwen3vl = self.model.model
+            ref_inputs_embeds = ref_qwen3vl.get_input_embeddings()(vl_input["input_ids"])
+            print(f"[REF] inputs_embeds: shape={ref_inputs_embeds.shape}, mean={ref_inputs_embeds.mean():.6f}, std={ref_inputs_embeds.std():.6f}")
+
+            # Split path
+            lm_kwargs = self._preprocess_vl_input(vl_input)
+            split_hidden = self._language_model_forward(**lm_kwargs)
+
+        diff = (ref_hidden - split_hidden).abs()
+        print(f"[DEBUG] hidden_states diff: mean={diff.mean():.8f}, max={diff.max():.8f}, "
+              f"ref_mean={ref_hidden.mean():.6f}, split_mean={split_hidden.mean():.6f}")
+        # --- END DEBUG ---
 
         # Step 1: data-dependent preprocessing (eager, not compiled)
         lm_kwargs = self._preprocess_vl_input(vl_input)
