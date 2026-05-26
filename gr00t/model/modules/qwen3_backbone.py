@@ -135,7 +135,6 @@ class Qwen3Backbone(torch.nn.Module):
 
         # 1. Text embedding
         inputs_embeds = qwen3vl_model.get_input_embeddings()(vl_input["input_ids"])
-        print(f"[CHK1] inputs_embeds: shape={inputs_embeds.shape}, mean={inputs_embeds.mean():.6f}, std={inputs_embeds.std():.6f}")
 
         # 2. Image encoding
         pixel_values = vl_input["pixel_values"]
@@ -144,20 +143,15 @@ class Qwen3Backbone(torch.nn.Module):
             pixel_values, image_grid_thw
         )
         image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-        print(f"[CHK2] image_embeds: shape={image_embeds.shape}, mean={image_embeds.mean():.6f}, std={image_embeds.std():.6f}")
 
         # 3. Scatter image embeddings into text embedding
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
         image_mask_expanded = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         inputs_embeds = inputs_embeds.masked_scatter(image_mask_expanded, image_embeds)
-        print(f"[CHK3] inputs_embeds after scatter: shape={inputs_embeds.shape}, mean={inputs_embeds.mean():.6f}, std={inputs_embeds.std():.6f}")
 
         # 4. Visual position masks and deepstack features
-        visual_pos_masks = image_mask  # [B, seq_len]
+        visual_pos_masks = image_mask
         deepstack_visual_embeds = deepstack_image_embeds
-        print(f"[CHK4] visual_pos_masks: shape={visual_pos_masks.shape}, sum={visual_pos_masks.sum()}")
-        if deepstack_visual_embeds:
-            print(f"[CHK4] deepstack count={len(deepstack_visual_embeds)}, shape[0]={deepstack_visual_embeds[0].shape}")
 
         # 5. Compute position_ids (data-dependent)
         position_ids, rope_deltas = qwen3vl_model.get_rope_index(
@@ -165,7 +159,6 @@ class Qwen3Backbone(torch.nn.Module):
             image_grid_thw=image_grid_thw,
             attention_mask=vl_input["attention_mask"],
         )
-        print(f"[CHK5] position_ids: shape={position_ids.shape}, dtype={position_ids.dtype}")
 
         return {
             "input_ids": None,
@@ -179,34 +172,74 @@ class Qwen3Backbone(torch.nn.Module):
         }
 
     def _language_model_forward(self, **kwargs) -> torch.Tensor:
-        """Run the language model forward pass (compilable with torchair)."""
-        outputs = self.model.model.language_model(**kwargs, output_hidden_states=True)
-        return outputs.hidden_states[-1]
+        """Run the language model forward pass (compilable with torchair).
+
+        Replicates Qwen3VLTextModel.forward but skips the final layer norm,
+        returning pre-norm hidden states to match the auto-recorded
+        hidden_states[-1] convention from the original full-model path.
+        """
+        from transformers.masking_utils import create_causal_mask
+
+        lm = self.model.model.language_model
+        inputs_embeds = kwargs["inputs_embeds"]
+        attention_mask = kwargs.get("attention_mask")
+        position_ids = kwargs.get("position_ids")
+        past_key_values = kwargs.get("past_key_values")
+        cache_position = kwargs.get("cache_position")
+        visual_pos_masks = kwargs.get("visual_pos_masks")
+        deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds")
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+
+        if position_ids is None:
+            position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
+        elif position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+
+        if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+            text_position_ids = position_ids[0]
+            position_ids = position_ids[1:]
+        else:
+            text_position_ids = position_ids[0]
+
+        causal_mask = create_causal_mask(
+            config=lm.config,
+            input_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+            position_ids=text_position_ids,
+        )
+
+        hidden_states = inputs_embeds
+        position_embeddings = lm.rotary_emb(hidden_states, position_ids)
+
+        for layer_idx, decoder_layer in enumerate(lm.layers):
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=text_position_ids,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+
+            if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
+                hidden_states = lm._deepstack_process(
+                    hidden_states, visual_pos_masks, deepstack_visual_embeds[layer_idx]
+                )
+
+        # Return pre-norm hidden states (no final norm)
+        return hidden_states
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
-        # 0. Set frozen module to eval
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
-
-        # --- DEBUG: compare original vs split path ---
-        with torch.no_grad():
-            # Original path (reference)
-            ref_outputs = self.model(**vl_input, output_hidden_states=True)
-            ref_hidden = ref_outputs.hidden_states[-1]
-            # Also get the original language_model inputs for comparison
-            ref_qwen3vl = self.model.model
-            ref_inputs_embeds = ref_qwen3vl.get_input_embeddings()(vl_input["input_ids"])
-            print(f"[REF] inputs_embeds: shape={ref_inputs_embeds.shape}, mean={ref_inputs_embeds.mean():.6f}, std={ref_inputs_embeds.std():.6f}")
-
-            # Split path
-            lm_kwargs = self._preprocess_vl_input(vl_input)
-            split_hidden = self._language_model_forward(**lm_kwargs)
-
-        diff = (ref_hidden - split_hidden).abs()
-        print(f"[DEBUG] hidden_states diff: mean={diff.mean():.8f}, max={diff.max():.8f}, "
-              f"ref_mean={ref_hidden.mean():.6f}, split_mean={split_hidden.mean():.6f}")
-        # --- END DEBUG ---
 
         # Step 1: data-dependent preprocessing (eager, not compiled)
         lm_kwargs = self._preprocess_vl_input(vl_input)
