@@ -133,6 +133,7 @@ class Qwen3Backbone(torch.nn.Module):
 
         Called once on first inference when model is already on the target device.
         Bypasses torch.linspace / .tolist() / .item() that block torchair compilation.
+        Also monkey-patches visual attention to use reshape instead of dynamic split.
         """
         if self._visual_cache_initialized:
             return
@@ -166,31 +167,78 @@ class Qwen3Backbone(torch.nn.Module):
             grid_thw.prod(-1) // visual.spatial_merge_size**2
         ).tolist()
 
+        # 5. Monkey-patch visual attention to use reshape instead of dynamic split
+        self._patch_visual_attention(visual)
+
         self._visual_cache_initialized = True
         logger.info("Visual encoder static values cached")
 
-    def _compiled_visual_forward(self, pixel_values: torch.Tensor):
-        """Visual encoder forward using cached position embeddings (compilable with torchair).
+    def _patch_visual_attention(self, visual):
+        """Replace Qwen3VLVisionAttention.forward with a reshape-based version.
 
-        Bypasses fast_pos_embed_interpolate and rot_pos_emb which have data-dependent ops.
+        The original uses torch.split(lengths.tolist(), dim=2) which creates
+        data-dependent symbolic shapes. We replace it with reshape to static
+        [num_images, num_heads, tokens_per_image, head_dim].
         """
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb_vision
+
+        num_images = 4
+        tokens_per_image = 64  # Fixed for grid_thw=[[1,16,16]]x4 with merge_size=2
+
+        for blk in visual.blocks:
+            attn = blk.attn
+            num_heads = attn.num_heads
+            head_dim = attn.head_dim
+            scaling = attn.scaling
+            proj = attn.proj
+            qkv = attn.qkv
+
+            def _make_forward(nh, hd, sc, pr, qkvl, n_img, tpi):
+                def _forward(self_attn, hidden_states, cu_seqlens=None, position_embeddings=None, **kwargs):
+                    seq_length = hidden_states.shape[0]
+                    q, k, v = (
+                        qkvl(hidden_states)
+                        .reshape(seq_length, 3, nh, hd)
+                        .permute(1, 0, 2, 3)
+                        .unbind(0)
+                    )
+                    cos, sin = position_embeddings
+                    q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+
+                    # Reshape to batched format: [seq, nh, hd] → [n_img, nh, tpi, hd]
+                    q = q.reshape(n_img, tpi, nh, hd).permute(0, 2, 1, 3)
+                    k = k.reshape(n_img, tpi, nh, hd).permute(0, 2, 1, 3)
+                    v = v.reshape(n_img, tpi, nh, hd).permute(0, 2, 1, 3)
+
+                    attn_output = torch.nn.functional.scaled_dot_product_attention(
+                        q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=sc,
+                    )
+
+                    # Reshape back: [n_img, nh, tpi, hd] → [seq, hidden]
+                    attn_output = attn_output.permute(0, 2, 1, 3).reshape(seq_length, -1).contiguous()
+                    attn_output = pr(attn_output)
+                    return attn_output
+
+                return _forward
+
+            attn.forward = _make_forward(num_heads, head_dim, scaling, proj, qkv, num_images, tokens_per_image).__get__(attn, type(attn))
+
+        logger.info("Patched visual attention with reshape-based forward")
+
+    def _compiled_visual_forward(self, pixel_values: torch.Tensor):
+    def _compiled_visual_forward(self, pixel_values: torch.Tensor):
+        """Visual encoder forward using cached position embeddings (compilable with torchair)."""
         visual = self.model.model.visual
 
-        # 1. Patch embedding (Conv3d)
         hidden_states = visual.patch_embed(pixel_values)
-
-        # 2. Add cached position embeddings
         hidden_states = hidden_states + self._cached_visual_pos_embeds.to(
             hidden_states.device, hidden_states.dtype
         )
-
-        # 3. Cached rotary position embeddings
         position_embeddings = (
             self._cached_visual_pe_cos.to(hidden_states.device, hidden_states.dtype),
             self._cached_visual_pe_sin.to(hidden_states.device, hidden_states.dtype),
         )
 
-        # 4. Transformer blocks with deepstack
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(visual.blocks):
             hidden_states = blk(
@@ -203,9 +251,7 @@ class Qwen3Backbone(torch.nn.Module):
                 deepstack_feature = visual.deepstack_merger_list[idx](hidden_states)
                 deepstack_feature_lists.append(deepstack_feature)
 
-        # 5. Merger
         hidden_states = visual.merger(hidden_states)
-
         return hidden_states, deepstack_feature_lists
 
     def _preprocess_vl_input(self, vl_input: dict) -> dict:
