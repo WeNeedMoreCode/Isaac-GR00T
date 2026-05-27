@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 # NPU torchair compilation toggle: set to 1 to enable, 0 to disable
-syx_compile = 1
+syx_compile = 0
 
 import numpy as np
 import torch

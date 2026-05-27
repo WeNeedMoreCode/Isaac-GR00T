@@ -179,21 +179,25 @@ class Qwen3Backbone(torch.nn.Module):
         The original uses torch.split(lengths.tolist(), dim=2) which creates
         data-dependent symbolic shapes. We replace it with reshape to static
         [num_images, num_heads, tokens_per_image, head_dim].
+
+        Uses explicit matmul + softmax(float32) + matmul to match the original
+        eager attention path exactly (no SDPA which has different numerics).
         """
         from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb_vision
 
         num_images = 4
-        tokens_per_image = 64  # Fixed for grid_thw=[[1,16,16]]x4 with merge_size=2
+        tokens_per_image = 256  # 16*16=256 per image, spatial merge happens in merger layer
 
-        for blk in visual.blocks:
+        for layer_num, blk in enumerate(visual.blocks):
             attn = blk.attn
             num_heads = attn.num_heads
             head_dim = attn.head_dim
             scaling = attn.scaling
             proj = attn.proj
             qkv = attn.qkv
+            original_forward = attn.forward
 
-            def _make_forward(nh, hd, sc, pr, qkvl, n_img, tpi):
+            def _make_forward(nh, hd, sc, pr, qkvl, n_img, tpi, orig_fwd, ln):
                 def _forward(self_attn, hidden_states, cu_seqlens=None, position_embeddings=None, **kwargs):
                     seq_length = hidden_states.shape[0]
                     q, k, v = (
@@ -210,22 +214,34 @@ class Qwen3Backbone(torch.nn.Module):
                     k = k.reshape(n_img, tpi, nh, hd).permute(0, 2, 1, 3)
                     v = v.reshape(n_img, tpi, nh, hd).permute(0, 2, 1, 3)
 
-                    attn_output = torch.nn.functional.scaled_dot_product_attention(
-                        q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=sc,
-                    )
+                    # Explicit eager attention: matmul + softmax(float32) + matmul
+                    # Matches original eager_attention_forward exactly
+                    attn_weights = torch.matmul(q, k.transpose(-2, -1)) * sc
+                    attn_weights = torch.nn.functional.softmax(
+                        attn_weights, dim=-1, dtype=torch.float32
+                    ).to(q.dtype)
+                    attn_output = torch.matmul(attn_weights, v)
 
                     # Reshape back: [n_img, nh, tpi, hd] → [seq, hidden]
                     attn_output = attn_output.permute(0, 2, 1, 3).reshape(seq_length, -1).contiguous()
                     attn_output = pr(attn_output)
+
+                    # DEBUG: compare with original forward
+                    orig_out = orig_fwd(hidden_states, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings, **kwargs)
+                    diff = (attn_output.detach().float() - orig_out.detach().float()).abs()
+                    print(f"[DEBUG attn L{ln}] diff mean={diff.mean():.8f} max={diff.max():.8f}")
+
                     return attn_output
 
                 return _forward
 
-            attn.forward = _make_forward(num_heads, head_dim, scaling, proj, qkv, num_images, tokens_per_image).__get__(attn, type(attn))
+            attn.forward = _make_forward(
+                num_heads, head_dim, scaling, proj, qkv,
+                num_images, tokens_per_image, original_forward, layer_num
+            ).__get__(attn, type(attn))
 
         logger.info("Patched visual attention with reshape-based forward")
 
-    def _compiled_visual_forward(self, pixel_values: torch.Tensor):
     def _compiled_visual_forward(self, pixel_values: torch.Tensor):
         """Visual encoder forward using cached position embeddings (compilable with torchair)."""
         visual = self.model.model.visual
@@ -268,12 +284,28 @@ class Qwen3Backbone(torch.nn.Module):
         # 1. Text embedding
         inputs_embeds = qwen3vl_model.get_input_embeddings()(vl_input["input_ids"])
 
-        # 2. Image encoding (use compiled visual forward with cached statics)
-        self._ensure_visual_cache()
+        # 2. Image encoding — dual-path comparison for debugging
         pixel_values = vl_input["pixel_values"].to(self.model.model.visual.dtype)
+
+        # Path A: original get_image_features
+        ref_image_embeds_tuple, ref_deepstack = qwen3vl_model.get_image_features(
+            pixel_values, vl_input["image_grid_thw"]
+        )
+        ref_image_embeds = torch.cat(ref_image_embeds_tuple, dim=0)
+
+        # Path B: our patched _compiled_visual_forward
+        self._ensure_visual_cache()
         raw_embeds, deepstack_image_embeds = self._compiled_visual_forward(pixel_values)
         image_embeds_list = torch.split(raw_embeds, self._cached_visual_split_sizes)
-        image_embeds = torch.cat(image_embeds_list, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+        patched_image_embeds = torch.cat(image_embeds_list, dim=0)
+
+        # Compare
+        diff = (ref_image_embeds.float() - patched_image_embeds.float()).abs()
+        print(f"[DEBUG visual] ref   mean={ref_image_embeds.float().mean():.6f} std={ref_image_embeds.float().std():.6f} shape={ref_image_embeds.shape}")
+        print(f"[DEBUG visual] patch mean={patched_image_embeds.float().mean():.6f} std={patched_image_embeds.float().std():.6f} shape={patched_image_embeds.shape}")
+        print(f"[DEBUG visual] diff  mean={diff.mean():.6f} max={diff.max():.6f}")
+
+        image_embeds = patched_image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
 
         # 3. Scatter image embeddings into text embedding
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
