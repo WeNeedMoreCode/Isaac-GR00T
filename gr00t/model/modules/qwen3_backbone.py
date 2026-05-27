@@ -16,6 +16,7 @@
 import logging
 
 import torch
+import torch.nn.functional as F
 from transformers.feature_extraction_utils import BatchFeature
 
 
@@ -86,6 +87,8 @@ class Qwen3Backbone(torch.nn.Module):
                     p.data = p.data.to(torch.float32)
                     logger.debug(f"Casting trainable parameter {n} to fp32")
 
+        self._visual_cache_initialized = False
+
     def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool, tune_top_llm_layers: int):
         self.tune_llm = tune_llm
         self.tune_visual = tune_visual
@@ -125,6 +128,86 @@ class Qwen3Backbone(torch.nn.Module):
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
+    def _ensure_visual_cache(self):
+        """Lazily pre-compute and cache visual encoder static values.
+
+        Called once on first inference when model is already on the target device.
+        Bypasses torch.linspace / .tolist() / .item() that block torchair compilation.
+        """
+        if self._visual_cache_initialized:
+            return
+
+        visual = self.model.model.visual
+        # Fixed grid_thw for the dataset: 4 images, each 16x16
+        grid_thw = torch.tensor(
+            [[1, 16, 16]] * 4, dtype=torch.long, device=visual.patch_embed.proj.weight.device
+        )
+
+        # 1. Position embeddings (from fast_pos_embed_interpolate)
+        self._cached_visual_pos_embeds = visual.fast_pos_embed_interpolate(grid_thw)
+
+        # 2. Rotary position embeddings (from rot_pos_emb)
+        rotary_pos_emb = visual.rot_pos_emb(grid_thw)
+        seq_len = rotary_pos_emb.shape[0]
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        self._cached_visual_pe_cos = emb.cos()
+        self._cached_visual_pe_sin = emb.sin()
+
+        # 3. cu_seqlens for attention
+        cu_seqlens = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+        ).cumsum(dim=0, dtype=torch.int32)
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        self._cached_visual_cu_seqlens = cu_seqlens
+
+        # 4. split_sizes for get_image_features output
+        self._cached_visual_split_sizes = (
+            grid_thw.prod(-1) // visual.spatial_merge_size**2
+        ).tolist()
+
+        self._visual_cache_initialized = True
+        logger.info("Visual encoder static values cached")
+
+    def _compiled_visual_forward(self, pixel_values: torch.Tensor):
+        """Visual encoder forward using cached position embeddings (compilable with torchair).
+
+        Bypasses fast_pos_embed_interpolate and rot_pos_emb which have data-dependent ops.
+        """
+        visual = self.model.model.visual
+
+        # 1. Patch embedding (Conv3d)
+        hidden_states = visual.patch_embed(pixel_values)
+
+        # 2. Add cached position embeddings
+        hidden_states = hidden_states + self._cached_visual_pos_embeds.to(
+            hidden_states.device, hidden_states.dtype
+        )
+
+        # 3. Cached rotary position embeddings
+        position_embeddings = (
+            self._cached_visual_pe_cos.to(hidden_states.device, hidden_states.dtype),
+            self._cached_visual_pe_sin.to(hidden_states.device, hidden_states.dtype),
+        )
+
+        # 4. Transformer blocks with deepstack
+        deepstack_feature_lists = []
+        for layer_num, blk in enumerate(visual.blocks):
+            hidden_states = blk(
+                hidden_states,
+                cu_seqlens=self._cached_visual_cu_seqlens.to(hidden_states.device),
+                position_embeddings=position_embeddings,
+            )
+            if layer_num in visual.deepstack_visual_indexes:
+                idx = visual.deepstack_visual_indexes.index(layer_num)
+                deepstack_feature = visual.deepstack_merger_list[idx](hidden_states)
+                deepstack_feature_lists.append(deepstack_feature)
+
+        # 5. Merger
+        hidden_states = visual.merger(hidden_states)
+
+        return hidden_states, deepstack_feature_lists
+
     def _preprocess_vl_input(self, vl_input: dict) -> dict:
         """Run all data-dependent preprocessing (image encoding, embedding, position_ids,
         causal mask, RoPE embeddings, and visual indices).
@@ -139,13 +222,12 @@ class Qwen3Backbone(torch.nn.Module):
         # 1. Text embedding
         inputs_embeds = qwen3vl_model.get_input_embeddings()(vl_input["input_ids"])
 
-        # 2. Image encoding
-        pixel_values = vl_input["pixel_values"]
-        image_grid_thw = vl_input["image_grid_thw"]
-        image_embeds, deepstack_image_embeds = qwen3vl_model.get_image_features(
-            pixel_values, image_grid_thw
-        )
-        image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+        # 2. Image encoding (use compiled visual forward with cached statics)
+        self._ensure_visual_cache()
+        pixel_values = vl_input["pixel_values"].to(self.model.model.visual.dtype)
+        raw_embeds, deepstack_image_embeds = self._compiled_visual_forward(pixel_values)
+        image_embeds_list = torch.split(raw_embeds, self._cached_visual_split_sizes)
+        image_embeds = torch.cat(image_embeds_list, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
 
         # 3. Scatter image embeddings into text embedding
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
@@ -159,12 +241,11 @@ class Qwen3Backbone(torch.nn.Module):
         # 5. Compute position_ids (data-dependent)
         position_ids, rope_deltas = qwen3vl_model.get_rope_index(
             vl_input["input_ids"],
-            image_grid_thw=image_grid_thw,
+            image_grid_thw=vl_input["image_grid_thw"],
             attention_mask=vl_input["attention_mask"],
         )
 
         # 6. Pre-compute items needed by the decoder loop
-        # Position ids dimension handling
         if position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
@@ -173,7 +254,6 @@ class Qwen3Backbone(torch.nn.Module):
         else:
             text_position_ids = position_ids[0]
 
-        # Causal mask (data-dependent on attention_mask values)
         cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
         causal_mask = create_causal_mask(
             config=lm.config,
@@ -184,12 +264,9 @@ class Qwen3Backbone(torch.nn.Module):
             position_ids=text_position_ids,
         )
 
-        # RoPE position embeddings
         position_embeddings = lm.rotary_emb(inputs_embeds, position_ids)
 
-        # Pre-compute integer indices for deepstack (avoids boolean indexing in compiled code)
-        # visual_pos_masks: [B, seq_len] boolean -> integer indices along seq_len dim
-        visual_indices = visual_pos_masks[0].nonzero().squeeze(-1)  # [num_visual_tokens]
+        visual_indices = visual_pos_masks[0].nonzero().squeeze(-1)
 
         return {
             "inputs_embeds": inputs_embeds,
@@ -229,12 +306,15 @@ class Qwen3Backbone(torch.nn.Module):
             )
 
             if deepstack_visual_embeds is not None and layer_idx < len(deepstack_visual_embeds):
-                # Use integer indexing (static shape) instead of boolean indexing (data-dependent shape)
                 visual_embed = deepstack_visual_embeds[layer_idx].to(
                     hidden_states.device, hidden_states.dtype
                 )
-                current = hidden_states[:, visual_indices, :]
-                hidden_states[:, visual_indices, :] = current + visual_embed.unsqueeze(0)
+                idx = visual_indices.unsqueeze(0).unsqueeze(-1).expand(
+                    -1, -1, hidden_states.shape[-1]
+                )
+                current = torch.gather(hidden_states, 1, idx)
+                updated = current + visual_embed.unsqueeze(0)
+                hidden_states = hidden_states.scatter(1, idx, updated)
 
         # Return pre-norm hidden states (no final norm)
         return hidden_states
