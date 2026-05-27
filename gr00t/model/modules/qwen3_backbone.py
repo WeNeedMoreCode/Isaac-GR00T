@@ -126,12 +126,15 @@ class Qwen3Backbone(torch.nn.Module):
         return BatchFeature(data=batch)
 
     def _preprocess_vl_input(self, vl_input: dict) -> dict:
-        """Run all data-dependent preprocessing (image encoding, embedding, position_ids).
+        """Run all data-dependent preprocessing (image encoding, embedding, position_ids,
+        causal mask, RoPE embeddings, and visual indices).
 
-        Mirrors the first half of Qwen3VLModel.forward so that only the language_model
-        call remains for torchair compilation.
+        All operations here are data-dependent and must run eagerly (not compiled).
         """
+        from transformers.masking_utils import create_causal_mask
+
         qwen3vl_model = self.model.model  # Qwen3VLModel
+        lm = self.model.model.language_model
 
         # 1. Text embedding
         inputs_embeds = qwen3vl_model.get_input_embeddings()(vl_input["input_ids"])
@@ -160,78 +163,78 @@ class Qwen3Backbone(torch.nn.Module):
             attention_mask=vl_input["attention_mask"],
         )
 
-        return {
-            "input_ids": None,
-            "position_ids": position_ids,
-            "attention_mask": vl_input["attention_mask"],
-            "past_key_values": None,
-            "inputs_embeds": inputs_embeds,
-            "cache_position": None,
-            "visual_pos_masks": visual_pos_masks,
-            "deepstack_visual_embeds": deepstack_visual_embeds,
-        }
-
-    def _language_model_forward(self, **kwargs) -> torch.Tensor:
-        """Run the language model forward pass (compilable with torchair).
-
-        Replicates Qwen3VLTextModel.forward but skips the final layer norm,
-        returning pre-norm hidden states to match the auto-recorded
-        hidden_states[-1] convention from the original full-model path.
-        """
-        from transformers.masking_utils import create_causal_mask
-
-        lm = self.model.model.language_model
-        inputs_embeds = kwargs["inputs_embeds"]
-        attention_mask = kwargs.get("attention_mask")
-        position_ids = kwargs.get("position_ids")
-        past_key_values = kwargs.get("past_key_values")
-        cache_position = kwargs.get("cache_position")
-        visual_pos_masks = kwargs.get("visual_pos_masks")
-        deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds")
-
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
-
-        if position_ids is None:
-            position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
-        elif position_ids.ndim == 2:
+        # 6. Pre-compute items needed by the decoder loop
+        # Position ids dimension handling
+        if position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
-
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
             text_position_ids = position_ids[0]
             position_ids = position_ids[1:]
         else:
             text_position_ids = position_ids[0]
 
+        # Causal mask (data-dependent on attention_mask values)
+        cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
         causal_mask = create_causal_mask(
             config=lm.config,
             input_embeds=inputs_embeds,
-            attention_mask=attention_mask,
+            attention_mask=vl_input["attention_mask"],
             cache_position=cache_position,
-            past_key_values=past_key_values,
+            past_key_values=None,
             position_ids=text_position_ids,
         )
 
+        # RoPE position embeddings
+        position_embeddings = lm.rotary_emb(inputs_embeds, position_ids)
+
+        # Pre-compute integer indices for deepstack (avoids boolean indexing in compiled code)
+        # visual_pos_masks: [B, seq_len] boolean -> integer indices along seq_len dim
+        visual_indices = visual_pos_masks[0].nonzero().squeeze(-1)  # [num_visual_tokens]
+
+        return {
+            "inputs_embeds": inputs_embeds,
+            "causal_mask": causal_mask,
+            "text_position_ids": text_position_ids,
+            "cache_position": cache_position,
+            "position_embeddings": position_embeddings,
+            "deepstack_visual_embeds": deepstack_visual_embeds,
+            "visual_indices": visual_indices,
+        }
+
+    def _language_model_forward(self, **kwargs) -> torch.Tensor:
+        """Run the decoder loop only (compilable with torchair).
+
+        All data-dependent operations are pre-computed in _preprocess_vl_input.
+        Returns pre-norm hidden states (no final norm).
+        """
+        inputs_embeds = kwargs["inputs_embeds"]
+        causal_mask = kwargs["causal_mask"]
+        text_position_ids = kwargs["text_position_ids"]
+        cache_position = kwargs["cache_position"]
+        position_embeddings = kwargs["position_embeddings"]
+        deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds")
+        visual_indices = kwargs.get("visual_indices")
+
+        lm = self.model.model.language_model
         hidden_states = inputs_embeds
-        position_embeddings = lm.rotary_emb(hidden_states, position_ids)
 
         for layer_idx, decoder_layer in enumerate(lm.layers):
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
                 position_ids=text_position_ids,
-                past_key_values=past_key_values,
+                past_key_values=None,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
             )
 
-            if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
-                hidden_states = lm._deepstack_process(
-                    hidden_states, visual_pos_masks, deepstack_visual_embeds[layer_idx]
+            if deepstack_visual_embeds is not None and layer_idx < len(deepstack_visual_embeds):
+                # Use integer indexing (static shape) instead of boolean indexing (data-dependent shape)
+                visual_embed = deepstack_visual_embeds[layer_idx].to(
+                    hidden_states.device, hidden_states.dtype
                 )
+                current = hidden_states[:, visual_indices, :]
+                hidden_states[:, visual_indices, :] = current + visual_embed.unsqueeze(0)
 
         # Return pre-norm hidden states (no final norm)
         return hidden_states
