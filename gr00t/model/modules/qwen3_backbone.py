@@ -264,7 +264,7 @@ class Qwen3Backbone(torch.nn.Module):
         return hidden_states, deepstack_feature_lists
 
     def _compiled_visual_forward_p1(self, pixel_values: torch.Tensor):
-        """Visual encoder part 1: patch_embed + first half of blocks."""
+        """Visual encoder part 1: patch_embed + block 0 only."""
         visual = self.model.model.visual
         hidden_states = visual.patch_embed(pixel_values)
         hidden_states = hidden_states + self._cached_visual_pos_embeds.to(
@@ -275,27 +275,24 @@ class Qwen3Backbone(torch.nn.Module):
             self._cached_visual_pe_sin.to(hidden_states.device, hidden_states.dtype),
         )
         cu_seqlens = self._cached_visual_cu_seqlens.to(hidden_states.device)
-        mid = len(visual.blocks) // 2
         deepstack_feature_lists = []
-        for layer_num in range(mid):
-            hidden_states = visual.blocks[layer_num](
-                hidden_states, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings,
-            )
-            if layer_num in visual.deepstack_visual_indexes:
-                idx = visual.deepstack_visual_indexes.index(layer_num)
-                deepstack_feature_lists.append(visual.deepstack_merger_list[idx](hidden_states))
+        hidden_states = visual.blocks[0](
+            hidden_states, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings,
+        )
+        if 0 in visual.deepstack_visual_indexes:
+            idx = visual.deepstack_visual_indexes.index(0)
+            deepstack_feature_lists.append(visual.deepstack_merger_list[idx](hidden_states))
         return hidden_states, deepstack_feature_lists
 
     def _compiled_visual_forward_p2(self, hidden_states: torch.Tensor, deepstack_feature_lists: list):
-        """Visual encoder part 2: second half of blocks + merger."""
+        """Visual encoder part 2: blocks 1-23 + merger."""
         visual = self.model.model.visual
         position_embeddings = (
             self._cached_visual_pe_cos.to(hidden_states.device, hidden_states.dtype),
             self._cached_visual_pe_sin.to(hidden_states.device, hidden_states.dtype),
         )
         cu_seqlens = self._cached_visual_cu_seqlens.to(hidden_states.device)
-        mid = len(visual.blocks) // 2
-        for layer_num in range(mid, len(visual.blocks)):
+        for layer_num in range(1, len(visual.blocks)):
             hidden_states = visual.blocks[layer_num](
                 hidden_states, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings,
             )
