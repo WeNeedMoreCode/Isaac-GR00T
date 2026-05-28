@@ -214,7 +214,6 @@ class Qwen3Backbone(torch.nn.Module):
                     v = v.reshape(n_img, tpi, nh, hd).permute(0, 2, 1, 3)
 
                     # Explicit eager attention: matmul + softmax(float32) + matmul
-                    # Matches original eager_attention_forward exactly
                     attn_weights = torch.matmul(q, k.transpose(-2, -1)) * sc
                     attn_weights = torch.nn.functional.softmax(
                         attn_weights, dim=-1, dtype=torch.float32
@@ -272,17 +271,25 @@ class Qwen3Backbone(torch.nn.Module):
         )
         return hidden_states
 
-    def _compiled_visual_forward_block0(self, hidden_states: torch.Tensor):
-        """Single block 0 only."""
+    def _compiled_visual_block0_attn(self, hidden_states: torch.Tensor):
+        """Block 0 attention part: norm1 → attn → residual."""
         visual = self.model.model.visual
+        blk = visual.blocks[0]
         position_embeddings = (
             self._cached_visual_pe_cos.to(hidden_states.device, hidden_states.dtype),
             self._cached_visual_pe_sin.to(hidden_states.device, hidden_states.dtype),
         )
         cu_seqlens = self._cached_visual_cu_seqlens.to(hidden_states.device)
-        hidden_states = visual.blocks[0](
-            hidden_states, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings,
+        hidden_states = hidden_states + blk.attn(
+            blk.norm1(hidden_states),
+            cu_seqlens=cu_seqlens, position_embeddings=position_embeddings,
         )
+        return hidden_states
+
+    def _compiled_visual_block0_mlp(self, hidden_states: torch.Tensor):
+        """Block 0 MLP part: norm2 → mlp → residual."""
+        blk = self.model.model.visual.blocks[0]
+        hidden_states = hidden_states + blk.mlp(blk.norm2(hidden_states))
         return hidden_states
 
     def _compiled_visual_forward_p2(self, hidden_states: torch.Tensor, deepstack_feature_lists: list):
@@ -321,7 +328,8 @@ class Qwen3Backbone(torch.nn.Module):
         self._ensure_visual_cache()
         pixel_values = vl_input["pixel_values"].to(self.model.model.visual.dtype)
         hidden_states = self._compiled_visual_forward_p1(pixel_values)
-        hidden_states = self._compiled_visual_forward_block0(hidden_states)
+        hidden_states = self._compiled_visual_block0_attn(hidden_states)
+        hidden_states = self._compiled_visual_block0_mlp(hidden_states)
         raw_embeds, deepstack_image_embeds = self._compiled_visual_forward_p2(hidden_states, [])
         image_embeds_list = torch.split(raw_embeds, self._cached_visual_split_sizes)
         image_embeds = torch.cat(image_embeds_list, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)

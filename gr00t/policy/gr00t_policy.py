@@ -26,7 +26,8 @@ from typing import Any
 # NPU torchair compilation toggle: set to 1 to enable, 0 to disable
 syx_compile = 1
 compile_visual_p1 = False  # patch_embed + pos embed only
-compile_visual_block0 = False  # single block 0 only
+compile_visual_block0_attn = False  # block 0 attention: norm1 → attn → residual
+compile_visual_block0_mlp = False  # block 0 MLP: norm2 → mlp → residual
 compile_visual_p2 = False  # blocks 1-23 + merger
 
 import numpy as np
@@ -146,8 +147,10 @@ class Gr00tPolicy(BasePolicy):
             format_cast_to_nz(model)
             if compile_visual_p1:
                 compile_for_npu(model.backbone, "_compiled_visual_forward_p1")
-            if compile_visual_block0:
-                compile_for_npu(model.backbone, "_compiled_visual_forward_block0")
+            if compile_visual_block0_attn:
+                compile_for_npu(model.backbone, "_compiled_visual_block0_attn")
+            if compile_visual_block0_mlp:
+                compile_for_npu(model.backbone, "_compiled_visual_block0_mlp")
             if compile_visual_p2:
                 compile_for_npu(model.backbone, "_compiled_visual_forward_p2")
             compile_for_npu(model.backbone, "_language_model_forward")
