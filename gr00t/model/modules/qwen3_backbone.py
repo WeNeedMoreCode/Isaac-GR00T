@@ -263,6 +263,48 @@ class Qwen3Backbone(torch.nn.Module):
         hidden_states = visual.merger(hidden_states)
         return hidden_states, deepstack_feature_lists
 
+    def _compiled_visual_forward_p1(self, pixel_values: torch.Tensor):
+        """Visual encoder part 1: patch_embed + first half of blocks."""
+        visual = self.model.model.visual
+        hidden_states = visual.patch_embed(pixel_values)
+        hidden_states = hidden_states + self._cached_visual_pos_embeds.to(
+            hidden_states.device, hidden_states.dtype
+        )
+        position_embeddings = (
+            self._cached_visual_pe_cos.to(hidden_states.device, hidden_states.dtype),
+            self._cached_visual_pe_sin.to(hidden_states.device, hidden_states.dtype),
+        )
+        cu_seqlens = self._cached_visual_cu_seqlens.to(hidden_states.device)
+        mid = len(visual.blocks) // 2
+        deepstack_feature_lists = []
+        for layer_num in range(mid):
+            hidden_states = visual.blocks[layer_num](
+                hidden_states, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings,
+            )
+            if layer_num in visual.deepstack_visual_indexes:
+                idx = visual.deepstack_visual_indexes.index(layer_num)
+                deepstack_feature_lists.append(visual.deepstack_merger_list[idx](hidden_states))
+        return hidden_states, deepstack_feature_lists
+
+    def _compiled_visual_forward_p2(self, hidden_states: torch.Tensor, deepstack_feature_lists: list):
+        """Visual encoder part 2: second half of blocks + merger."""
+        visual = self.model.model.visual
+        position_embeddings = (
+            self._cached_visual_pe_cos.to(hidden_states.device, hidden_states.dtype),
+            self._cached_visual_pe_sin.to(hidden_states.device, hidden_states.dtype),
+        )
+        cu_seqlens = self._cached_visual_cu_seqlens.to(hidden_states.device)
+        mid = len(visual.blocks) // 2
+        for layer_num in range(mid, len(visual.blocks)):
+            hidden_states = visual.blocks[layer_num](
+                hidden_states, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings,
+            )
+            if layer_num in visual.deepstack_visual_indexes:
+                idx = visual.deepstack_visual_indexes.index(layer_num)
+                deepstack_feature_lists.append(visual.deepstack_merger_list[idx](hidden_states))
+        hidden_states = visual.merger(hidden_states)
+        return hidden_states, deepstack_feature_lists
+
     def _preprocess_vl_input(self, vl_input: dict) -> dict:
         """Run all data-dependent preprocessing (image encoding, embedding, position_ids,
         causal mask, RoPE embeddings, and visual indices).
@@ -280,7 +322,9 @@ class Qwen3Backbone(torch.nn.Module):
         # 2. Image encoding (use compiled visual forward with cached statics)
         self._ensure_visual_cache()
         pixel_values = vl_input["pixel_values"].to(self.model.model.visual.dtype)
-        raw_embeds, deepstack_image_embeds = self._compiled_visual_forward(pixel_values)
+        raw_embeds, deepstack_image_embeds = self._compiled_visual_forward_p2(
+            *self._compiled_visual_forward_p1(pixel_values)
+        )
         image_embeds_list = torch.split(raw_embeds, self._cached_visual_split_sizes)
         image_embeds = torch.cat(image_embeds_list, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
 

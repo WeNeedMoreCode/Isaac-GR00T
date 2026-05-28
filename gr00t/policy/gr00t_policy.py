@@ -25,6 +25,9 @@ from typing import Any
 
 # NPU torchair compilation toggle: set to 1 to enable, 0 to disable
 syx_compile = 1
+compile_visual = False  # Visual encoder: torchair compilation causes numerical differences
+compile_visual_p1 = False  # patch_embed + first 12 blocks
+compile_visual_p2 = False  # last 12 blocks + merger
 
 import numpy as np
 import torch
@@ -113,8 +116,9 @@ class Gr00tPolicy(BasePolicy):
         if is_npu:
             model = model.to(device=device, dtype=torch.float16)
             # Conv3D lacks a precompiled kernel under jit_compile=False.
-            # Only needed in eager mode; torchair compilation handles Conv3d natively.
-            if not syx_compile:
+            # Needed when patch_embed runs in eager mode (not compiled by torchair).
+            _visual_compile_includes_patch_embed = compile_visual or compile_visual_p1
+            if not _visual_compile_includes_patch_embed:
                 try:
                     patch_embed = model.backbone.model.model.visual.patch_embed
                     _orig_forward = patch_embed.forward
@@ -141,7 +145,12 @@ class Gr00tPolicy(BasePolicy):
             from gr00t.model.npu_utils import compile_for_npu, format_cast_to_nz
 
             format_cast_to_nz(model)
-            compile_for_npu(model.backbone, "_compiled_visual_forward")
+            if compile_visual:
+                compile_for_npu(model.backbone, "_compiled_visual_forward")
+            if compile_visual_p1:
+                compile_for_npu(model.backbone, "_compiled_visual_forward_p1")
+            if compile_visual_p2:
+                compile_for_npu(model.backbone, "_compiled_visual_forward_p2")
             compile_for_npu(model.backbone, "_language_model_forward")
             compile_for_npu(model.action_head.model, "forward")
 
