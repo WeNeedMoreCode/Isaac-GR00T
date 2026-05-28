@@ -264,25 +264,26 @@ class Qwen3Backbone(torch.nn.Module):
         return hidden_states, deepstack_feature_lists
 
     def _compiled_visual_forward_p1(self, pixel_values: torch.Tensor):
-        """Visual encoder part 1: patch_embed + block 0 only."""
+        """Visual encoder part 1: patch_embed + pos embed only (no blocks)."""
         visual = self.model.model.visual
         hidden_states = visual.patch_embed(pixel_values)
         hidden_states = hidden_states + self._cached_visual_pos_embeds.to(
             hidden_states.device, hidden_states.dtype
         )
+        return hidden_states
+
+    def _compiled_visual_forward_block0(self, hidden_states: torch.Tensor):
+        """Single block 0 only."""
+        visual = self.model.model.visual
         position_embeddings = (
             self._cached_visual_pe_cos.to(hidden_states.device, hidden_states.dtype),
             self._cached_visual_pe_sin.to(hidden_states.device, hidden_states.dtype),
         )
         cu_seqlens = self._cached_visual_cu_seqlens.to(hidden_states.device)
-        deepstack_feature_lists = []
         hidden_states = visual.blocks[0](
             hidden_states, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings,
         )
-        if 0 in visual.deepstack_visual_indexes:
-            idx = visual.deepstack_visual_indexes.index(0)
-            deepstack_feature_lists.append(visual.deepstack_merger_list[idx](hidden_states))
-        return hidden_states, deepstack_feature_lists
+        return hidden_states
 
     def _compiled_visual_forward_p2(self, hidden_states: torch.Tensor, deepstack_feature_lists: list):
         """Visual encoder part 2: blocks 1-23 + merger."""
@@ -319,9 +320,9 @@ class Qwen3Backbone(torch.nn.Module):
         # 2. Image encoding (use compiled visual forward with cached statics)
         self._ensure_visual_cache()
         pixel_values = vl_input["pixel_values"].to(self.model.model.visual.dtype)
-        raw_embeds, deepstack_image_embeds = self._compiled_visual_forward_p2(
-            *self._compiled_visual_forward_p1(pixel_values)
-        )
+        hidden_states = self._compiled_visual_forward_p1(pixel_values)
+        hidden_states = self._compiled_visual_forward_block0(hidden_states)
+        raw_embeds, deepstack_image_embeds = self._compiled_visual_forward_p2(hidden_states, [])
         image_embeds_list = torch.split(raw_embeds, self._cached_visual_split_sizes)
         image_embeds = torch.cat(image_embeds_list, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
 
