@@ -345,6 +345,14 @@ class Qwen3Backbone(torch.nn.Module):
         # 1. Text embedding
         inputs_embeds = qwen3vl_model.get_input_embeddings()(vl_input["input_ids"])
 
+        # Checkpoint 1: pixel_values
+        pv = vl_input["pixel_values"].float()
+        print(f"[CKPT] pixel_values mean={pv.mean():.6f} std={pv.std():.6f} shape={pv.shape}")
+
+        # Checkpoint 2: text embedding
+        ie = inputs_embeds.float()
+        print(f"[CKPT] text_embeds   mean={ie.mean():.6f} std={ie.std():.6f} shape={ie.shape}")
+
         # 2. Image encoding (use compiled visual forward with cached statics)
         self._ensure_visual_cache()
         pixel_values = vl_input["pixel_values"].to(self.model.model.visual.dtype)
@@ -355,6 +363,10 @@ class Qwen3Backbone(torch.nn.Module):
         raw_embeds = self._compiled_visual_forward_merger(hidden_states)
         image_embeds_list = torch.split(raw_embeds, self._cached_visual_split_sizes)
         image_embeds = torch.cat(image_embeds_list, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+
+        # Checkpoint 3: image_embeds
+        img_emb = image_embeds.float()
+        print(f"[CKPT] image_embeds  mean={img_emb.mean():.6f} std={img_emb.std():.6f} shape={img_emb.shape}")
 
         # 3. Scatter image embeddings into text embedding
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
@@ -456,6 +468,10 @@ class Qwen3Backbone(torch.nn.Module):
 
         # Step 2: language model (compilable with torchair)
         hidden_states = self._language_model_forward(**lm_kwargs)
+
+        # Checkpoint 4: hidden_states
+        hs = hidden_states.float()
+        print(f"[CKPT] hidden_states mean={hs.mean():.6f} std={hs.std():.6f} shape={hs.shape}")
 
         # Step 3: output processing
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
