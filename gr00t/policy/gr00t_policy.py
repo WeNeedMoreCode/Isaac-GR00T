@@ -28,7 +28,8 @@ syx_compile = 1
 compile_visual_p1 = False  # patch_embed + pos embed only
 compile_visual_block0_attn = False  # block 0 attention: norm1 → attn → residual
 compile_visual_block0_mlp = False  # block 0 MLP: norm2 → mlp → residual
-compile_visual_p2 = False  # blocks 1-23 + merger
+compile_visual_blocks = False  # blocks 1-23 in 3D
+compile_visual_merger = False  # merger in 3D
 
 import numpy as np
 import torch
@@ -151,8 +152,10 @@ class Gr00tPolicy(BasePolicy):
                 compile_for_npu(model.backbone, "_compiled_visual_block0_attn")
             if compile_visual_block0_mlp:
                 compile_for_npu(model.backbone, "_compiled_visual_block0_mlp")
-            if compile_visual_p2:
-                compile_for_npu(model.backbone, "_compiled_visual_forward_p2")
+            if compile_visual_blocks:
+                compile_for_npu(model.backbone, "_compiled_visual_forward_blocks")
+            if compile_visual_merger:
+                compile_for_npu(model.backbone, "_compiled_visual_forward_merger")
             compile_for_npu(model.backbone, "_language_model_forward")
             compile_for_npu(model.action_head.model, "forward")
 
