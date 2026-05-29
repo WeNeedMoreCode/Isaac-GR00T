@@ -198,10 +198,13 @@ class Qwen3Backbone(torch.nn.Module):
 
             def _make_forward(nh, hd, sc, pr, qkvl, n_img, tpi):
                 def _forward(self_attn, hidden_states, cu_seqlens=None, position_embeddings=None, **kwargs):
-                    seq_length = hidden_states.shape[0]
+                    was_3d = hidden_states.ndim == 3
+                    seq_length = hidden_states.shape[-2]
+                    # QKV projection: sees original ndim so torchair uses 3D kernels when applicable
+                    qkv_out = qkvl(hidden_states)
+                    # Flatten for attention computation (reshape/rotary operate on 2D)
                     q, k, v = (
-                        qkvl(hidden_states)
-                        .reshape(seq_length, 3, nh, hd)
+                        qkv_out.reshape(seq_length, 3, nh, hd)
                         .permute(1, 0, 2, 3)
                         .unbind(0)
                     )
@@ -222,6 +225,9 @@ class Qwen3Backbone(torch.nn.Module):
 
                     # Reshape back: [n_img, nh, tpi, hd] → [seq, hidden]
                     attn_output = attn_output.permute(0, 2, 1, 3).reshape(seq_length, -1).contiguous()
+                    # Output projection: restore 3D so torchair uses 3D kernels
+                    if was_3d:
+                        attn_output = attn_output.unsqueeze(0)
                     attn_output = pr(attn_output)
                     return attn_output
 
@@ -272,7 +278,7 @@ class Qwen3Backbone(torch.nn.Module):
         return hidden_states
 
     def _compiled_visual_block0_attn(self, hidden_states: torch.Tensor):
-        """Block 0 attention part: norm1 → attn → residual."""
+        """Block 0 attention part: norm1 → attn → residual. Uses 3D for compiled precision."""
         visual = self.model.model.visual
         blk = visual.blocks[0]
         position_embeddings = (
@@ -280,16 +286,25 @@ class Qwen3Backbone(torch.nn.Module):
             self._cached_visual_pe_sin.to(hidden_states.device, hidden_states.dtype),
         )
         cu_seqlens = self._cached_visual_cu_seqlens.to(hidden_states.device)
-        hidden_states = hidden_states + blk.attn(
-            blk.norm1(hidden_states),
+        # Pass 3D input to attn so Linear layers see [1, seq, dim]
+        normed_3d = blk.norm1(hidden_states).unsqueeze(0)
+        attn_out_3d = blk.attn(
+            normed_3d,
             cu_seqlens=cu_seqlens, position_embeddings=position_embeddings,
         )
+        hidden_states = hidden_states + attn_out_3d.squeeze(0)
         return hidden_states
 
     def _compiled_visual_block0_mlp(self, hidden_states: torch.Tensor):
-        """Block 0 MLP part: norm2 → mlp → residual."""
+        """Block 0 MLP part: norm2 → mlp → residual. Adds batch dim for 3D compilation."""
         blk = self.model.model.visual.blocks[0]
-        hidden_states = hidden_states + blk.mlp(blk.norm2(hidden_states))
+        normed = blk.norm2(hidden_states)
+        # Add batch dim: [seq, dim] → [1, seq, dim]
+        normed_3d = normed.unsqueeze(0)
+        mlp_out_3d = blk.mlp(normed_3d)
+        # Remove batch dim: [1, seq, dim] → [seq, dim]
+        mlp_out = mlp_out_3d.squeeze(0)
+        hidden_states = hidden_states + mlp_out
         return hidden_states
 
     def _compiled_visual_forward_p2(self, hidden_states: torch.Tensor, deepstack_feature_lists: list):
