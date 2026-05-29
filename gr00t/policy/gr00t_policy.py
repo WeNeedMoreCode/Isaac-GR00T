@@ -99,7 +99,7 @@ class Gr00tPolicy(BasePolicy):
         # Load the pretrained model and move to target device with bfloat16 precision
         model = AutoModel.from_pretrained(model_dir)
         model.eval()  # Set model to evaluation mode
-        model.to(device=device, dtype=torch.bfloat16)
+        model.to(device=device, dtype=torch.float16)
         self.model = model
 
         # Load the processor for input/output transformation.
@@ -401,7 +401,7 @@ class Gr00tPolicy(BasePolicy):
 
         # Step 3: Collate processed inputs into a single batch for model
         collated_inputs = self.collate_fn(processed_inputs)
-        collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
+        collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.float16)
 
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():

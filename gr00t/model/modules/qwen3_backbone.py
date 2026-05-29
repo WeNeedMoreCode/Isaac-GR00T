@@ -75,7 +75,7 @@ class Qwen3Backbone(torch.nn.Module):
                 )
                 extra_kwargs["attn_implementation"] = "sdpa"
         if load_bf16:
-            extra_kwargs["torch_dtype"] = torch.bfloat16
+            extra_kwargs["torch_dtype"] = torch.float16
 
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_name,
