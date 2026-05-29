@@ -130,7 +130,29 @@ class Qwen3Backbone(torch.nn.Module):
         # 0. Set frozen module to eval
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
+
+        # Checkpoint 1: pixel_values
+        pv = vl_input["pixel_values"].float()
+        print(f"[CKPT] pixel_values mean={pv.mean():.6f} std={pv.std():.6f} shape={pv.shape}")
+
+        # Checkpoint 2: text embedding
+        inputs_embeds = self.model.model.get_input_embeddings()(vl_input["input_ids"])
+        ie = inputs_embeds.float()
+        print(f"[CKPT] text_embeds   mean={ie.mean():.6f} std={ie.std():.6f} shape={ie.shape}")
+
+        # Checkpoint 3: visual encoder output (image features)
+        image_embeds_tuple, _ = self.model.model.get_image_features(
+            vl_input["pixel_values"].to(self.model.model.visual.dtype),
+            vl_input["image_grid_thw"],
+        )
+        img_emb = torch.cat(image_embeds_tuple, dim=0).float()
+        print(f"[CKPT] image_embeds  mean={img_emb.mean():.6f} std={img_emb.std():.6f} shape={img_emb.shape}")
+
+        # Checkpoint 4: full model output (hidden_states)
         outputs = self.model(**vl_input, output_hidden_states=True)
+        hs = outputs.hidden_states[-1].float()
+        print(f"[CKPT] hidden_states mean={hs.mean():.6f} std={hs.std():.6f} shape={hs.shape}")
+
         outputs = outputs.hidden_states[-1]
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
         attention_mask = vl_input["attention_mask"] == 1
