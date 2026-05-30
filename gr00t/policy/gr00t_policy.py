@@ -27,6 +27,8 @@ import numpy as np
 import torch
 from transformers import AutoModel, AutoProcessor
 
+syx_save = False  # Save model inputs to file (for cross-platform precision comparison)
+
 from gr00t.data.embodiment_tags import FINETUNE_ONLY_TAGS, POSTTRAIN_TAGS, EmbodimentTag
 from gr00t.data.interfaces import BaseProcessor
 from gr00t.data.types import MessageType, ModalityConfig, VLAStepData
@@ -402,6 +404,18 @@ class Gr00tPolicy(BasePolicy):
         # Step 3: Collate processed inputs into a single batch for model
         collated_inputs = self.collate_fn(processed_inputs)
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.float16)
+
+        # Save model inputs for cross-platform comparison
+        if syx_save:
+            import os
+            save_dir = "syx_saved_inputs"
+            os.makedirs(save_dir, exist_ok=True)
+            if not hasattr(self, '_syx_step_counter'):
+                self._syx_step_counter = 0
+            save_path = os.path.join(save_dir, f"step{self._syx_step_counter}.pt")
+            torch.save({k: v.cpu() for k, v in collated_inputs.items()}, save_path)
+            print(f"[SYX_SAVE] saved {save_path}")
+            self._syx_step_counter += 1
 
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():
