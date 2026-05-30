@@ -25,6 +25,7 @@ from typing import Any
 
 # NPU torchair compilation toggle: set to 1 to enable, 0 to disable
 syx_compile = 1
+syx_load = False  # Load saved model inputs from file (for cross-platform precision comparison)
 compile_visual_p1 = False  # patch_embed + pos embed only
 compile_visual_block0_attn = False  # block 0 attention: norm1 → attn → residual
 compile_visual_block0_mlp = False  # block 0 MLP: norm2 → mlp → residual
@@ -461,6 +462,21 @@ class Gr00tPolicy(BasePolicy):
         # Step 3: Collate processed inputs into a single batch for model
         collated_inputs = self.collate_fn(processed_inputs)
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.float16)
+
+        # Load saved inputs for cross-platform comparison
+        if syx_load:
+            import os
+            save_dir = "syx_saved_inputs"
+            if not hasattr(self, '_syx_step_counter'):
+                self._syx_step_counter = 0
+            load_path = os.path.join(save_dir, f"step{self._syx_step_counter}.pt")
+            if os.path.exists(load_path):
+                saved = torch.load(load_path, map_location="cpu")
+                collated_inputs = {k: v.to(self.model.device) for k, v in saved.items()}
+                print(f"[SYX_LOAD] loaded {load_path}")
+            else:
+                print(f"[SYX_LOAD] {load_path} not found, using real data")
+            self._syx_step_counter += 1
 
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():
