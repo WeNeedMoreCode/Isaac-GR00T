@@ -131,27 +131,51 @@ class Qwen3Backbone(torch.nn.Module):
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
 
+        if not hasattr(self, '_verbose_step_counter'):
+            self._verbose_step_counter = 0
+            self._verbose_step_limit = 3
+        verbose = self._verbose_step_counter < self._verbose_step_limit
+        self._verbose_step_counter += 1
+
         # Checkpoint 1: pixel_values
-        pv = vl_input["pixel_values"].float()
-        print(f"[CKPT] pixel_values mean={pv.mean():.6f} std={pv.std():.6f} shape={pv.shape}")
+        if verbose:
+            pv = vl_input["pixel_values"].float()
+            print(f"[CKPT] pixel_values mean={pv.mean():.6f} std={pv.std():.6f} shape={pv.shape}")
 
         # Checkpoint 2: text embedding
         inputs_embeds = self.model.model.get_input_embeddings()(vl_input["input_ids"])
-        ie = inputs_embeds.float()
-        print(f"[CKPT] text_embeds   mean={ie.mean():.6f} std={ie.std():.6f} shape={ie.shape}")
+        if verbose:
+            ie = inputs_embeds.float()
+            print(f"[CKPT] text_embeds   mean={ie.mean():.6f} std={ie.std():.6f} shape={ie.shape}")
 
-        # Checkpoint 3: visual encoder output (image features)
-        image_embeds_tuple, _ = self.model.model.get_image_features(
-            vl_input["pixel_values"].to(self.model.model.visual.dtype),
-            vl_input["image_grid_thw"],
-        )
-        img_emb = torch.cat(image_embeds_tuple, dim=0).float()
-        print(f"[CKPT] image_embeds  mean={img_emb.mean():.6f} std={img_emb.std():.6f} shape={img_emb.shape}")
+        # Register hooks for intermediate visual encoder checkpoints (only when verbose)
+        visual = self.model.model.visual
+        hooks = []
+
+        if verbose:
+            def _make_hook(tag):
+                def hook(module, input, output):
+                    out = output[0] if isinstance(output, tuple) else output
+                    out_f = out.float()
+                    print(f"[CKPT-V] {tag} mean={out_f.mean():.6f} std={out_f.std():.6f} shape={out.shape}")
+                return hook
+
+            hooks.append(visual.patch_embed.register_forward_hook(_make_hook("after_patch_embed")))
+            for i in [0, 5, 11, 17, 23]:
+                hooks.append(visual.blocks[i].register_forward_hook(_make_hook(f"after_block{i:02d}  ")))
+            hooks.append(visual.merger.register_forward_hook(_make_hook("after_merger    ")))
+
+        # Full model forward (hooks fire during visual encoder pass)
+        outputs = self.model(**vl_input, output_hidden_states=True)
+
+        # Remove hooks
+        for h in hooks:
+            h.remove()
 
         # Checkpoint 4: full model output (hidden_states)
-        outputs = self.model(**vl_input, output_hidden_states=True)
-        hs = outputs.hidden_states[-1].float()
-        print(f"[CKPT] hidden_states mean={hs.mean():.6f} std={hs.std():.6f} shape={hs.shape}")
+        if verbose:
+            hs = outputs.hidden_states[-1].float()
+            print(f"[CKPT] hidden_states mean={hs.mean():.6f} std={hs.std():.6f} shape={hs.shape}")
 
         outputs = outputs.hidden_states[-1]
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id

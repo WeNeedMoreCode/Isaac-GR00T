@@ -413,7 +413,7 @@ class Gr00tPolicy(BasePolicy):
             if not hasattr(self, '_syx_step_counter'):
                 self._syx_step_counter = 0
             save_path = os.path.join(save_dir, f"step{self._syx_step_counter}.pt")
-            torch.save({k: v.cpu() for k, v in collated_inputs.items()}, save_path)
+            torch.save(collated_inputs, save_path)
             print(f"[SYX_SAVE] saved {save_path}")
             self._syx_step_counter += 1
 
