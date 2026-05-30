@@ -378,9 +378,33 @@ class Qwen3Backbone(torch.nn.Module):
         if verbose:
             hs = hidden_states.float()
             print(f"[CKPT-V] after_blk0_mlp  mean={hs.mean():.6f} std={hs.std():.6f} shape={hs.shape}")
+
+        # Register sub-module hooks on block 1 for intra-block instrumentation
+        sub_hooks = []
+        if verbose:
+            blk1 = self.model.model.visual.blocks[1]
+
+            def _sub_hook(tag):
+                def hook(module, input, output):
+                    out = output[0] if isinstance(output, tuple) else output
+                    out_f = out.float()
+                    print(f"[CKPT-V] blk1.{tag} mean={out_f.mean():.6f} std={out_f.std():.6f}")
+                return hook
+
+            sub_hooks = [
+                blk1.norm1.register_forward_hook(_sub_hook("norm1")),
+                blk1.attn.register_forward_hook(_sub_hook("attn ")),
+                blk1.norm2.register_forward_hook(_sub_hook("norm2")),
+                blk1.mlp.register_forward_hook(_sub_hook("mlp  ")),
+            ]
+
         hidden_states, deepstack_image_embeds = self._compiled_visual_forward_blocks(
             hidden_states, 1, 24, [], _verbose=verbose
         )
+
+        for h in sub_hooks:
+            h.remove()
+
         raw_embeds = self._compiled_visual_forward_merger(hidden_states)
         if verbose:
             hs = raw_embeds.float()

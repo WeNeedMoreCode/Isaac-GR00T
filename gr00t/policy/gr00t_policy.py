@@ -25,7 +25,7 @@ from typing import Any
 
 # NPU torchair compilation toggle: set to 1 to enable, 0 to disable
 syx_compile = 1
-syx_load = False  # Load saved model inputs from file (for cross-platform precision comparison)
+syx_load = True  # Load saved model inputs from file (for cross-platform precision comparison)
 compile_visual_p1 = False  # patch_embed + pos embed only
 compile_visual_block0_attn = False  # block 0 attention: norm1 → attn → residual
 compile_visual_block0_mlp = False  # block 0 MLP: norm2 → mlp → residual
