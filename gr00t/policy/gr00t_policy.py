@@ -24,13 +24,9 @@ from pathlib import Path
 from typing import Any
 
 # NPU torchair compilation toggle: set to 1 to enable, 0 to disable
-syx_compile = 1
+syx_compile = 0
 syx_load = True  # Load saved model inputs from file (for cross-platform precision comparison)
-compile_visual_p1 = False  # patch_embed + pos embed only
-compile_visual_block0_attn = False  # block 0 attention: norm1 → attn → residual
-compile_visual_block0_mlp = False  # block 0 MLP: norm2 → mlp → residual
-compile_visual_blocks = False  # blocks 1-23 in 3D
-compile_visual_merger = False  # merger in 3D
+compile_visual = False  # compile the full visual encoder
 
 import numpy as np
 import torch
@@ -120,7 +116,7 @@ class Gr00tPolicy(BasePolicy):
             model = model.to(device=device, dtype=torch.float16)
             # Conv3D lacks a precompiled kernel under jit_compile=False.
             # Needed when patch_embed runs in eager mode (not compiled by torchair).
-            if not compile_visual_p1:
+            if not compile_visual:
                 try:
                     patch_embed = model.backbone.model.model.visual.patch_embed
                     _orig_forward = patch_embed.forward
@@ -147,16 +143,8 @@ class Gr00tPolicy(BasePolicy):
             from gr00t.model.npu_utils import compile_for_npu, format_cast_to_nz
 
             format_cast_to_nz(model)
-            if compile_visual_p1:
-                compile_for_npu(model.backbone, "_compiled_visual_forward_p1")
-            if compile_visual_block0_attn:
-                compile_for_npu(model.backbone, "_compiled_visual_block0_attn")
-            if compile_visual_block0_mlp:
-                compile_for_npu(model.backbone, "_compiled_visual_block0_mlp")
-            if compile_visual_blocks:
-                compile_for_npu(model.backbone, "_compiled_visual_forward_blocks")
-            if compile_visual_merger:
-                compile_for_npu(model.backbone, "_compiled_visual_forward_merger")
+            if compile_visual:
+                compile_for_npu(model.backbone, "_compiled_visual_forward")
             compile_for_npu(model.backbone, "_language_model_forward")
             compile_for_npu(model.action_head.model, "forward")
 

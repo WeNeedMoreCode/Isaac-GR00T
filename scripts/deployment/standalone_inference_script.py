@@ -635,7 +635,7 @@ class ArgsConfig:
     """Seed to use for reproducibility."""
 
     device: str = "cuda"
-    """Device to run inference on (cuda or npu)."""
+    """Device to run inference on (cuda, npu, or cpu)."""
 
 
 def main(args: ArgsConfig):

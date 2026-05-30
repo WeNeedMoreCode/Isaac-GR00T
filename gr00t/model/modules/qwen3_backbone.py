@@ -88,8 +88,6 @@ class Qwen3Backbone(torch.nn.Module):
                     logger.debug(f"Casting trainable parameter {n} to fp32")
 
         self._visual_cache_initialized = False
-        self._verbose_step_limit = 3  # only print [CKPT-V] for first N steps
-        self._verbose_step_counter = 0
 
     def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool, tune_top_llm_layers: int):
         self.tune_llm = tune_llm
@@ -243,7 +241,10 @@ class Qwen3Backbone(torch.nn.Module):
         logger.info("Patched visual attention with reshape-based forward")
 
     def _compiled_visual_forward(self, pixel_values: torch.Tensor):
-        """Visual encoder forward using cached position embeddings (compilable with torchair)."""
+        """Visual encoder forward using cached position embeddings (compilable with torchair).
+
+        Uses 3D tensors (fake batch dim) for better precision when compiled with torchair.
+        """
         visual = self.model.model.visual
 
         hidden_states = visual.patch_embed(pixel_values)
@@ -254,87 +255,25 @@ class Qwen3Backbone(torch.nn.Module):
             self._cached_visual_pe_cos.to(hidden_states.device, hidden_states.dtype),
             self._cached_visual_pe_sin.to(hidden_states.device, hidden_states.dtype),
         )
+        cu_seqlens = self._cached_visual_cu_seqlens.to(hidden_states.device)
+
+        # Use 3D tensors for better torchair compiled precision
+        hidden_states = hidden_states.unsqueeze(0)
 
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(visual.blocks):
             hidden_states = blk(
                 hidden_states,
-                cu_seqlens=self._cached_visual_cu_seqlens.to(hidden_states.device),
+                cu_seqlens=cu_seqlens,
                 position_embeddings=position_embeddings,
             )
             if layer_num in visual.deepstack_visual_indexes:
                 idx = visual.deepstack_visual_indexes.index(layer_num)
-                deepstack_feature = visual.deepstack_merger_list[idx](hidden_states)
+                deepstack_feature = visual.deepstack_merger_list[idx](hidden_states.squeeze(0))
                 deepstack_feature_lists.append(deepstack_feature)
 
         hidden_states = visual.merger(hidden_states)
-        return hidden_states, deepstack_feature_lists
-
-    def _compiled_visual_forward_p1(self, pixel_values: torch.Tensor):
-        """Visual encoder part 1: patch_embed + pos embed only (no blocks)."""
-        visual = self.model.model.visual
-        hidden_states = visual.patch_embed(pixel_values)
-        hidden_states = hidden_states + self._cached_visual_pos_embeds.to(
-            hidden_states.device, hidden_states.dtype
-        )
-        return hidden_states
-
-    def _compiled_visual_block0_attn(self, hidden_states: torch.Tensor):
-        """Block 0 attention part: norm1 → attn → residual. Uses 3D for compiled precision."""
-        visual = self.model.model.visual
-        blk = visual.blocks[0]
-        position_embeddings = (
-            self._cached_visual_pe_cos.to(hidden_states.device, hidden_states.dtype),
-            self._cached_visual_pe_sin.to(hidden_states.device, hidden_states.dtype),
-        )
-        cu_seqlens = self._cached_visual_cu_seqlens.to(hidden_states.device)
-        # Pass 3D input to attn so Linear layers see [1, seq, dim]
-        normed_3d = blk.norm1(hidden_states).unsqueeze(0)
-        attn_out_3d = blk.attn(
-            normed_3d,
-            cu_seqlens=cu_seqlens, position_embeddings=position_embeddings,
-        )
-        hidden_states = hidden_states + attn_out_3d.squeeze(0)
-        return hidden_states
-
-    def _compiled_visual_block0_mlp(self, hidden_states: torch.Tensor):
-        """Block 0 MLP part: norm2 → mlp → residual. Adds batch dim for 3D compilation."""
-        blk = self.model.model.visual.blocks[0]
-        normed = blk.norm2(hidden_states)
-        # Add batch dim: [seq, dim] → [1, seq, dim]
-        normed_3d = normed.unsqueeze(0)
-        mlp_out_3d = blk.mlp(normed_3d)
-        # Remove batch dim: [1, seq, dim] → [seq, dim]
-        mlp_out = mlp_out_3d.squeeze(0)
-        hidden_states = hidden_states + mlp_out
-        return hidden_states
-
-    def _compiled_visual_forward_blocks(self, hidden_states: torch.Tensor, start: int, end: int, deepstack_feature_lists: list, _verbose: bool = False):
-        """Run blocks [start, end) in 3D for compiled precision."""
-        visual = self.model.model.visual
-        position_embeddings = (
-            self._cached_visual_pe_cos.to(hidden_states.device, hidden_states.dtype),
-            self._cached_visual_pe_sin.to(hidden_states.device, hidden_states.dtype),
-        )
-        cu_seqlens = self._cached_visual_cu_seqlens.to(hidden_states.device)
-        hidden_states_3d = hidden_states.unsqueeze(0)
-        for layer_num in range(start, end):
-            hidden_states_3d = visual.blocks[layer_num](
-                hidden_states_3d, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings,
-            )
-            if layer_num in visual.deepstack_visual_indexes:
-                idx = visual.deepstack_visual_indexes.index(layer_num)
-                deepstack_feature_lists.append(visual.deepstack_merger_list[idx](hidden_states_3d.squeeze(0)))
-            if _verbose and layer_num in [5, 11, 17, 23]:
-                hs = hidden_states_3d.squeeze(0).float()
-                print(f"[CKPT-V] after_block{layer_num:02d}  mean={hs.mean():.6f} std={hs.std():.6f}")
-        return hidden_states_3d.squeeze(0), deepstack_feature_lists
-
-    def _compiled_visual_forward_merger(self, hidden_states: torch.Tensor):
-        """Run merger in 3D for compiled precision."""
-        visual = self.model.model.visual
-        hidden_states_3d = visual.merger(hidden_states.unsqueeze(0))
-        return hidden_states_3d.squeeze(0)
+        return hidden_states.squeeze(0), deepstack_feature_lists
 
     def _preprocess_vl_input(self, vl_input: dict) -> dict:
         """Run all data-dependent preprocessing (image encoding, embedding, position_ids,
@@ -344,78 +283,18 @@ class Qwen3Backbone(torch.nn.Module):
         """
         from transformers.masking_utils import create_causal_mask
 
-        verbose = self._verbose_step_counter < self._verbose_step_limit
-        self._verbose_step_counter += 1
-
         qwen3vl_model = self.model.model  # Qwen3VLModel
         lm = self.model.model.language_model
 
         # 1. Text embedding
         inputs_embeds = qwen3vl_model.get_input_embeddings()(vl_input["input_ids"])
 
-        # Checkpoint 1: pixel_values
-        if verbose:
-            pv = vl_input["pixel_values"].float()
-            print(f"[CKPT] pixel_values mean={pv.mean():.6f} std={pv.std():.6f} shape={pv.shape}")
-
-        # Checkpoint 2: text embedding
-        if verbose:
-            ie = inputs_embeds.float()
-            print(f"[CKPT] text_embeds   mean={ie.mean():.6f} std={ie.std():.6f} shape={ie.shape}")
-
         # 2. Image encoding (use compiled visual forward with cached statics)
         self._ensure_visual_cache()
         pixel_values = vl_input["pixel_values"].to(self.model.model.visual.dtype)
-        hidden_states = self._compiled_visual_forward_p1(pixel_values)
-        if verbose:
-            hs = hidden_states.float()
-            print(f"[CKPT-V] after_p1        mean={hs.mean():.6f} std={hs.std():.6f} shape={hs.shape}")
-        hidden_states = self._compiled_visual_block0_attn(hidden_states)
-        if verbose:
-            hs = hidden_states.float()
-            print(f"[CKPT-V] after_blk0_attn mean={hs.mean():.6f} std={hs.std():.6f} shape={hs.shape}")
-        hidden_states = self._compiled_visual_block0_mlp(hidden_states)
-        if verbose:
-            hs = hidden_states.float()
-            print(f"[CKPT-V] after_blk0_mlp  mean={hs.mean():.6f} std={hs.std():.6f} shape={hs.shape}")
-
-        # Register sub-module hooks on block 1 for intra-block instrumentation
-        sub_hooks = []
-        if verbose:
-            blk1 = self.model.model.visual.blocks[1]
-
-            def _sub_hook(tag):
-                def hook(module, input, output):
-                    out = output[0] if isinstance(output, tuple) else output
-                    out_f = out.float()
-                    print(f"[CKPT-V] blk1.{tag} mean={out_f.mean():.6f} std={out_f.std():.6f}")
-                return hook
-
-            sub_hooks = [
-                blk1.norm1.register_forward_hook(_sub_hook("norm1")),
-                blk1.attn.register_forward_hook(_sub_hook("attn ")),
-                blk1.norm2.register_forward_hook(_sub_hook("norm2")),
-                blk1.mlp.register_forward_hook(_sub_hook("mlp  ")),
-            ]
-
-        hidden_states, deepstack_image_embeds = self._compiled_visual_forward_blocks(
-            hidden_states, 1, 24, [], _verbose=verbose
-        )
-
-        for h in sub_hooks:
-            h.remove()
-
-        raw_embeds = self._compiled_visual_forward_merger(hidden_states)
-        if verbose:
-            hs = raw_embeds.float()
-            print(f"[CKPT-V] after_merger    mean={hs.mean():.6f} std={hs.std():.6f} shape={hs.shape}")
+        raw_embeds, deepstack_image_embeds = self._compiled_visual_forward(pixel_values)
         image_embeds_list = torch.split(raw_embeds, self._cached_visual_split_sizes)
         image_embeds = torch.cat(image_embeds_list, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-
-        # Checkpoint 3: image_embeds
-        if verbose:
-            img_emb = image_embeds.float()
-            print(f"[CKPT] image_embeds  mean={img_emb.mean():.6f} std={img_emb.std():.6f} shape={img_emb.shape}")
 
         # 3. Scatter image embeddings into text embedding
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
@@ -517,11 +396,6 @@ class Qwen3Backbone(torch.nn.Module):
 
         # Step 2: language model (compilable with torchair)
         hidden_states = self._language_model_forward(**lm_kwargs)
-
-        # Checkpoint 4: hidden_states
-        if self._verbose_step_counter <= self._verbose_step_limit:
-            hs = hidden_states.float()
-            print(f"[CKPT] hidden_states mean={hs.mean():.6f} std={hs.std():.6f} shape={hs.shape}")
 
         # Step 3: output processing
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
