@@ -590,12 +590,29 @@ class Gr00tN1d7(PreTrainedModel):
         """
         Generate actions using the complete model.
         """
+        import time
+
         # Prepare inputs for backbone and action head
+        t0 = time.time()
         backbone_inputs, action_inputs = self.prepare_input(inputs)
+        t_prepare = time.time() - t0
 
         # Forward through backbone
+        t0 = time.time()
         backbone_outputs = self.backbone(backbone_inputs)
+        t_backbone = time.time() - t0
+
+        t0 = time.time()
         action_outputs = self.action_head.get_action(backbone_outputs, action_inputs, options)
+        t_action = time.time() - t0
+
+        if not hasattr(self, '_prof_step'):
+            self._prof_step = 0
+        self._prof_step += 1
+        if self._prof_step <= 4:
+            print(f"[PROF] model: prepare={t_prepare*1000:.1f}ms  "
+                  f"backbone={t_backbone*1000:.1f}ms  action_head={t_action*1000:.1f}ms  "
+                  f"total={(t_prepare+t_backbone+t_action)*1000:.1f}ms")
 
         return action_outputs
 

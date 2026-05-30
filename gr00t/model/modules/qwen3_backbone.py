@@ -281,18 +281,28 @@ class Qwen3Backbone(torch.nn.Module):
 
         All operations here are data-dependent and must run eagerly (not compiled).
         """
+        import time
         from transformers.masking_utils import create_causal_mask
 
         qwen3vl_model = self.model.model  # Qwen3VLModel
         lm = self.model.model.language_model
 
         # 1. Text embedding
+        t0 = time.time()
         inputs_embeds = qwen3vl_model.get_input_embeddings()(vl_input["input_ids"])
+        t_text = time.time() - t0
 
         # 2. Image encoding (use compiled visual forward with cached statics)
+        t0 = time.time()
         self._ensure_visual_cache()
         pixel_values = vl_input["pixel_values"].to(self.model.model.visual.dtype)
+        t_prep = time.time() - t0
+
+        t0 = time.time()
         raw_embeds, deepstack_image_embeds = self._compiled_visual_forward(pixel_values)
+        t_visual = time.time() - t0
+
+        t0 = time.time()
         image_embeds_list = torch.split(raw_embeds, self._cached_visual_split_sizes)
         image_embeds = torch.cat(image_embeds_list, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
 
@@ -334,6 +344,18 @@ class Qwen3Backbone(torch.nn.Module):
         position_embeddings = lm.rotary_emb(inputs_embeds, position_ids)
 
         visual_indices = visual_pos_masks[0].nonzero().squeeze(-1)
+
+        t_post = time.time() - t0
+        if not hasattr(self, '_profile_printed'):
+            self._profile_printed = False
+        if self._profile_printed:
+            self._profile_counter = getattr(self, '_profile_counter', 0) + 1
+            if self._profile_counter <= 3:
+                print(f"[PROF] preprocess: text_embed={t_text*1000:.1f}ms  prep={t_prep*1000:.1f}ms  "
+                      f"visual={t_visual*1000:.1f}ms  post={t_post*1000:.1f}ms  "
+                      f"total_pre={(t_text+t_prep+t_visual+t_post)*1000:.1f}ms")
+        else:
+            self._profile_printed = True
 
         return {
             "inputs_embeds": inputs_embeds,
@@ -387,19 +409,30 @@ class Qwen3Backbone(torch.nn.Module):
         return hidden_states
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
+        import time
         self.set_frozen_modules_to_eval_mode()
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
 
         # Step 1: data-dependent preprocessing (eager, not compiled)
+        t_total = time.time()
         lm_kwargs = self._preprocess_vl_input(vl_input)
+        t_preprocess = time.time() - t_total
 
         # Step 2: language model (compilable with torchair)
+        t0 = time.time()
         hidden_states = self._language_model_forward(**lm_kwargs)
+        t_lm = time.time() - t0
 
         # Step 3: output processing
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
         attention_mask = vl_input["attention_mask"] == 1
+
+        t_total = time.time() - t_total
+        if hasattr(self, '_profile_counter') and self._profile_counter <= 3:
+            print(f"[PROF] backbone_total={t_total*1000:.1f}ms  "
+                  f"preprocess={t_preprocess*1000:.1f}ms  lm={t_lm*1000:.1f}ms")
+
         return BatchFeature(
             data={
                 "backbone_features": hidden_states,

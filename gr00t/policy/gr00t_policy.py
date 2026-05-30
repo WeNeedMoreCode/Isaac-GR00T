@@ -448,6 +448,8 @@ class Gr00tPolicy(BasePolicy):
             processed_inputs.append(self.processor(messages))
 
         # Step 3: Collate processed inputs into a single batch for model
+        import time
+        t_collate = time.time()
         collated_inputs = self.collate_fn(processed_inputs)
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.float16)
 
@@ -464,11 +466,20 @@ class Gr00tPolicy(BasePolicy):
             else:
                 print(f"[SYX_LOAD] {load_path} not found, using real data")
             self._syx_step_counter += 1
+        t_collate = time.time() - t_collate
 
         # Step 4: Run model inference to predict actions
+        t_inference = time.time()
         with torch.inference_mode():
             model_pred = self.model.get_action(**collated_inputs)
         normalized_action = model_pred["action_pred"].float()
+        t_inference = time.time() - t_inference
+
+        if not hasattr(self, '_prof_step'):
+            self._prof_step = 0
+        self._prof_step += 1
+        if self._prof_step <= 4:
+            print(f"[PROF] step{self._prof_step-1}: collate={t_collate*1000:.1f}ms  inference={t_inference*1000:.1f}ms")
 
         # Step 5: Decode actions from normalized space back to physical units
         batched_states = {}
