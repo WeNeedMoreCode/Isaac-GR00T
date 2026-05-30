@@ -165,6 +165,13 @@ class Qwen3Backbone(torch.nn.Module):
                 hooks.append(visual.blocks[i].register_forward_hook(_make_hook(f"after_block{i:02d}  ")))
             hooks.append(visual.merger.register_forward_hook(_make_hook("after_merger    ")))
 
+            # Block 1 sub-module hooks for intra-block instrumentation
+            blk1 = visual.blocks[1]
+            hooks.append(blk1.norm1.register_forward_hook(_make_hook("blk1.norm1  ")))
+            hooks.append(blk1.attn.register_forward_hook(_make_hook("blk1.attn   ")))
+            hooks.append(blk1.norm2.register_forward_hook(_make_hook("blk1.norm2  ")))
+            hooks.append(blk1.mlp.register_forward_hook(_make_hook("blk1.mlp    ")))
+
         # Full model forward (hooks fire during visual encoder pass)
         outputs = self.model(**vl_input, output_hidden_states=True)
 

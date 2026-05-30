@@ -599,7 +599,7 @@ class ArgsConfig:
     action_horizon: int = 16
     """Action horizon to evaluate."""
 
-    video_backend: Literal["decord", "torchvision_av", "torchcodec", "opencv"] = "opencv"
+    video_backend: Literal["decord", "torchvision_av", "torchcodec", "opencv"] = "torchcodec"
     """Video backend to use for various codec options."""
 
     dataset_path: str = "demo_data/droid_sample"
