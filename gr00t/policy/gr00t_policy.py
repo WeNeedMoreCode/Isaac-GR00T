@@ -471,8 +471,7 @@ class Gr00tPolicy(BasePolicy):
                 self._syx_step_counter = 0
             load_path = os.path.join(save_dir, f"step{self._syx_step_counter}.pt")
             if os.path.exists(load_path):
-                saved = torch.load(load_path, map_location="cpu")
-                collated_inputs = {k: v.to(self.model.device) for k, v in saved.items()}
+                collated_inputs = torch.load(load_path, map_location=self.model.device)
                 print(f"[SYX_LOAD] loaded {load_path}")
             else:
                 print(f"[SYX_LOAD] {load_path} not found, using real data")

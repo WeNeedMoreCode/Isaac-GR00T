@@ -88,6 +88,8 @@ class Qwen3Backbone(torch.nn.Module):
                     logger.debug(f"Casting trainable parameter {n} to fp32")
 
         self._visual_cache_initialized = False
+        self._verbose_step_limit = 3  # only print [CKPT-V] for first N steps
+        self._verbose_step_counter = 0
 
     def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool, tune_top_llm_layers: int):
         self.tune_llm = tune_llm
@@ -307,7 +309,7 @@ class Qwen3Backbone(torch.nn.Module):
         hidden_states = hidden_states + mlp_out
         return hidden_states
 
-    def _compiled_visual_forward_blocks(self, hidden_states: torch.Tensor, start: int, end: int, deepstack_feature_lists: list):
+    def _compiled_visual_forward_blocks(self, hidden_states: torch.Tensor, start: int, end: int, deepstack_feature_lists: list, _verbose: bool = False):
         """Run blocks [start, end) in 3D for compiled precision."""
         visual = self.model.model.visual
         position_embeddings = (
@@ -323,6 +325,9 @@ class Qwen3Backbone(torch.nn.Module):
             if layer_num in visual.deepstack_visual_indexes:
                 idx = visual.deepstack_visual_indexes.index(layer_num)
                 deepstack_feature_lists.append(visual.deepstack_merger_list[idx](hidden_states_3d.squeeze(0)))
+            if _verbose and layer_num in [5, 11, 17, 23]:
+                hs = hidden_states_3d.squeeze(0).float()
+                print(f"[CKPT-V] after_block{layer_num:02d}  mean={hs.mean():.6f} std={hs.std():.6f}")
         return hidden_states_3d.squeeze(0), deepstack_feature_lists
 
     def _compiled_visual_forward_merger(self, hidden_states: torch.Tensor):
@@ -339,6 +344,9 @@ class Qwen3Backbone(torch.nn.Module):
         """
         from transformers.masking_utils import create_causal_mask
 
+        verbose = self._verbose_step_counter < self._verbose_step_limit
+        self._verbose_step_counter += 1
+
         qwen3vl_model = self.model.model  # Qwen3VLModel
         lm = self.model.model.language_model
 
@@ -346,27 +354,44 @@ class Qwen3Backbone(torch.nn.Module):
         inputs_embeds = qwen3vl_model.get_input_embeddings()(vl_input["input_ids"])
 
         # Checkpoint 1: pixel_values
-        pv = vl_input["pixel_values"].float()
-        print(f"[CKPT] pixel_values mean={pv.mean():.6f} std={pv.std():.6f} shape={pv.shape}")
+        if verbose:
+            pv = vl_input["pixel_values"].float()
+            print(f"[CKPT] pixel_values mean={pv.mean():.6f} std={pv.std():.6f} shape={pv.shape}")
 
         # Checkpoint 2: text embedding
-        ie = inputs_embeds.float()
-        print(f"[CKPT] text_embeds   mean={ie.mean():.6f} std={ie.std():.6f} shape={ie.shape}")
+        if verbose:
+            ie = inputs_embeds.float()
+            print(f"[CKPT] text_embeds   mean={ie.mean():.6f} std={ie.std():.6f} shape={ie.shape}")
 
         # 2. Image encoding (use compiled visual forward with cached statics)
         self._ensure_visual_cache()
         pixel_values = vl_input["pixel_values"].to(self.model.model.visual.dtype)
         hidden_states = self._compiled_visual_forward_p1(pixel_values)
+        if verbose:
+            hs = hidden_states.float()
+            print(f"[CKPT-V] after_p1        mean={hs.mean():.6f} std={hs.std():.6f} shape={hs.shape}")
         hidden_states = self._compiled_visual_block0_attn(hidden_states)
+        if verbose:
+            hs = hidden_states.float()
+            print(f"[CKPT-V] after_blk0_attn mean={hs.mean():.6f} std={hs.std():.6f} shape={hs.shape}")
         hidden_states = self._compiled_visual_block0_mlp(hidden_states)
-        hidden_states, deepstack_image_embeds = self._compiled_visual_forward_blocks(hidden_states, 1, 24, [])
+        if verbose:
+            hs = hidden_states.float()
+            print(f"[CKPT-V] after_blk0_mlp  mean={hs.mean():.6f} std={hs.std():.6f} shape={hs.shape}")
+        hidden_states, deepstack_image_embeds = self._compiled_visual_forward_blocks(
+            hidden_states, 1, 24, [], _verbose=verbose
+        )
         raw_embeds = self._compiled_visual_forward_merger(hidden_states)
+        if verbose:
+            hs = raw_embeds.float()
+            print(f"[CKPT-V] after_merger    mean={hs.mean():.6f} std={hs.std():.6f} shape={hs.shape}")
         image_embeds_list = torch.split(raw_embeds, self._cached_visual_split_sizes)
         image_embeds = torch.cat(image_embeds_list, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
 
         # Checkpoint 3: image_embeds
-        img_emb = image_embeds.float()
-        print(f"[CKPT] image_embeds  mean={img_emb.mean():.6f} std={img_emb.std():.6f} shape={img_emb.shape}")
+        if verbose:
+            img_emb = image_embeds.float()
+            print(f"[CKPT] image_embeds  mean={img_emb.mean():.6f} std={img_emb.std():.6f} shape={img_emb.shape}")
 
         # 3. Scatter image embeddings into text embedding
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
@@ -470,8 +495,9 @@ class Qwen3Backbone(torch.nn.Module):
         hidden_states = self._language_model_forward(**lm_kwargs)
 
         # Checkpoint 4: hidden_states
-        hs = hidden_states.float()
-        print(f"[CKPT] hidden_states mean={hs.mean():.6f} std={hs.std():.6f} shape={hs.shape}")
+        if self._verbose_step_counter <= self._verbose_step_limit:
+            hs = hidden_states.float()
+            print(f"[CKPT] hidden_states mean={hs.mean():.6f} std={hs.std():.6f} shape={hs.shape}")
 
         # Step 3: output processing
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
