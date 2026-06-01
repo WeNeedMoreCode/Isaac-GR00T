@@ -294,21 +294,7 @@ class Qwen3Backbone(torch.nn.Module):
         raw_embeds, deepstack_image_embeds = self._compiled_visual_forward(pixel_values)
         image_embeds = raw_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
 
-        # 3. Position IDs
-        position_ids, _ = qwen3vl_model.get_rope_index(
-            vl_input["input_ids"],
-            image_grid_thw=vl_input["image_grid_thw"],
-            attention_mask=vl_input["attention_mask"],
-        )
-        if position_ids.ndim == 2:
-            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
-        if position_ids.ndim == 3 and position_ids.shape[0] == 4:
-            text_position_ids = position_ids[0]
-            position_ids = position_ids[1:]
-        else:
-            text_position_ids = position_ids[0]
-
-        # 4. Causal mask + cache position
+        # 3. Causal mask + cache position
         cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
         causal_mask = create_causal_mask(
             config=lm.config,
@@ -316,20 +302,20 @@ class Qwen3Backbone(torch.nn.Module):
             attention_mask=vl_input["attention_mask"],
             cache_position=cache_position,
             past_key_values=None,
-            position_ids=text_position_ids,
+            position_ids=vl_input["text_position_ids"],
         )
 
-        # 5. RoPE embeddings
-        position_embeddings = lm.rotary_emb(inputs_embeds, position_ids)
+        # 4. RoPE embeddings
+        position_embeddings = lm.rotary_emb(inputs_embeds, vl_input["position_ids"])
 
-        # 6. Scatter image embeddings into text embedding
+        # 5. Scatter image embeddings into text embedding
         image_mask_expanded = vl_input["image_mask"].unsqueeze(-1).expand_as(inputs_embeds)
         inputs_embeds = inputs_embeds.masked_scatter(image_mask_expanded, image_embeds)
 
         return {
             "inputs_embeds": inputs_embeds,
             "causal_mask": causal_mask,
-            "text_position_ids": text_position_ids,
+            "text_position_ids": vl_input["text_position_ids"],
             "cache_position": cache_position,
             "position_embeddings": position_embeddings,
             "deepstack_visual_embeds": deepstack_image_embeds,
@@ -386,11 +372,28 @@ class Qwen3Backbone(torch.nn.Module):
         # Step 0: Ensure visual cache (eager, not compilable)
         self._ensure_visual_cache()
 
-        # Step 1: Pre-compute non-compilable values (nonzero has dynamic output shape)
+        # Step 1: Pre-compute non-compilable values
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
         visual_indices = image_mask[0].nonzero().squeeze(-1)
         vl_input["visual_indices"] = visual_indices
         vl_input["image_mask"] = image_mask
+
+        # Step 1b: Position IDs (get_rope_index uses .tolist(), not compilable)
+        qwen3vl_model = self.model.model
+        position_ids, _ = qwen3vl_model.get_rope_index(
+            vl_input["input_ids"],
+            image_grid_thw=vl_input["image_grid_thw"],
+            attention_mask=vl_input["attention_mask"],
+        )
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+        if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+            text_position_ids = position_ids[0]
+            position_ids = position_ids[1:]
+        else:
+            text_position_ids = position_ids[0]
+        vl_input["position_ids"] = position_ids
+        vl_input["text_position_ids"] = text_position_ids
 
         # Step 2: Preprocess (compilable with torchair)
         t0 = time.time()
