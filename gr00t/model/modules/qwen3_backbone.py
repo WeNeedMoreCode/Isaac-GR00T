@@ -309,8 +309,8 @@ class Qwen3Backbone(torch.nn.Module):
         position_embeddings = lm.rotary_emb(inputs_embeds, vl_input["position_ids"])
 
         # 5. Scatter image embeddings into text embedding
-        image_mask_expanded = vl_input["image_mask"].unsqueeze(-1).expand_as(inputs_embeds)
-        inputs_embeds = inputs_embeds.masked_scatter(image_mask_expanded, image_embeds)
+        idx = vl_input["visual_indices"].unsqueeze(0).unsqueeze(-1).expand(1, -1, inputs_embeds.shape[-1])
+        inputs_embeds = inputs_embeds.scatter(1, idx, image_embeds.unsqueeze(0))
 
         return {
             "inputs_embeds": inputs_embeds,
@@ -379,6 +379,7 @@ class Qwen3Backbone(torch.nn.Module):
         vl_input["image_mask"] = image_mask
 
         # Step 1b: Position IDs (get_rope_index uses .tolist(), not compilable)
+        t_rope = time.time()
         qwen3vl_model = self.model.model
         position_ids, _ = qwen3vl_model.get_rope_index(
             vl_input["input_ids"],
@@ -394,6 +395,7 @@ class Qwen3Backbone(torch.nn.Module):
             text_position_ids = position_ids[0]
         vl_input["position_ids"] = position_ids
         vl_input["text_position_ids"] = text_position_ids
+        t_rope = time.time() - t_rope
 
         # Step 2: Preprocess (compilable with torchair)
         t0 = time.time()
@@ -412,8 +414,9 @@ class Qwen3Backbone(torch.nn.Module):
             self._prof_step = 0
         self._prof_step += 1
         if self._prof_step <= 4:
-            print(f"[PROF] backbone: preprocess={t_preprocess*1000:.1f}ms  "
-                  f"lm={t_lm*1000:.1f}ms  total={((t_preprocess+t_lm)*1000):.1f}ms")
+            print(f"[PROF] backbone: rope_idx={t_rope*1000:.1f}ms  "
+                  f"preprocess={t_preprocess*1000:.1f}ms  lm={t_lm*1000:.1f}ms  "
+                  f"total={((t_rope+t_preprocess+t_lm)*1000):.1f}ms")
 
         return BatchFeature(
             data={
