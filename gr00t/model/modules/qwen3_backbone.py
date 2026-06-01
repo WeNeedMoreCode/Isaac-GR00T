@@ -398,13 +398,17 @@ class Qwen3Backbone(torch.nn.Module):
         t_rope = time.time() - t_rope
 
         # Step 2: Preprocess (compilable with torchair)
+        torch.npu.synchronize()
         t0 = time.time()
         lm_kwargs = self._preprocess_vl_input(vl_input)
+        torch.npu.synchronize()
         t_preprocess = time.time() - t0
 
         # Step 3: Language model (compilable with torchair)
+        torch.npu.synchronize()
         t0 = time.time()
         hidden_states = self._language_model_forward(**lm_kwargs)
+        torch.npu.synchronize()
         t_lm = time.time() - t0
 
         # Step 4: Output processing
