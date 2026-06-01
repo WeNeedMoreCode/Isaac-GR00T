@@ -428,60 +428,54 @@ def run_single_trajectory(
     modality_configs = deepcopy(loader.modality_configs)
     modality_configs.pop("action")
 
-    # Inference loop with async prefetching
+    # Inference loop with CPU/NPU pipeline overlap
     num_inference_steps = len(range(0, actual_steps, action_horizon))
     logging.info(f"\nRunning {num_inference_steps} inference steps...")
     logging.info(f"(Skipping first {skip_timing_steps} step(s) for timing statistics)")
-    logging.info("Using async prefetching: preparing step i+1 while GPU processes step i")
+    logging.info("Using pipeline overlap: CPU prepares step i+1 while NPU runs step i")
     logging.info("-" * 80)
-
-    # Create thread pool for async data preparation (single worker is sufficient)
-    executor = ThreadPoolExecutor(max_workers=1)
 
     # List of step counts to process
     step_counts = list(range(0, actual_steps, action_horizon))
 
-    # Prefetch first observation
-    future_obs = executor.submit(
-        prepare_observation_data,
-        traj,
-        step_counts[0],
-        modality_configs,
-        embodiment_tag,
-        loader,
+    # Prepare first step (CPU only, synchronous)
+    parsed_obs = prepare_observation_data(
+        traj, step_counts[0], modality_configs, embodiment_tag, loader
     )
+    collated_inputs, states = policy.prepare_inputs(parsed_obs)
 
     for step_idx, step_count in enumerate(step_counts):
         logging.info(
             f"\n[Step {step_idx + 1}/{num_inference_steps}] Processing timestep {step_count}"
         )
 
-        # Wait for data preparation to complete (should be ready from prefetch)
-        data_prep_start = time.time()
-        parsed_obs = future_obs.result()  # Blocks until ready
-        data_prep_time = time.time() - data_prep_start
+        # Step 1: Dispatch NPU inference (async, returns quickly)
+        inference_start = time.time()
+        model_pred = policy.dispatch_inference(collated_inputs)
 
-        # Prefetch NEXT observation while GPU runs inference on current one
+        # Step 2: CPU work for next step WHILE NPU runs (pipeline overlap)
+        data_prep_time = 0.0
         if step_idx + 1 < len(step_counts):
             next_step_count = step_counts[step_idx + 1]
-            future_obs = executor.submit(
-                prepare_observation_data,
-                traj,
-                next_step_count,
-                modality_configs,
-                embodiment_tag,
-                loader,
+            t0 = time.time()
+            parsed_obs_next = prepare_observation_data(
+                traj, next_step_count, modality_configs, embodiment_tag, loader
             )
+            collated_next, states_next = policy.prepare_inputs(parsed_obs_next)
+            data_prep_time = time.time() - t0
 
-        # Inference timing (GPU processing - CPU prepares next step in parallel)
-        inference_start = time.time()
-        _action_chunk, _ = policy.get_action(parsed_obs)
+        # Step 3: Wait for NPU and decode action (triggers NPU sync)
+        _action_chunk, _ = policy.decode_action(model_pred, states)
         inference_time = time.time() - inference_start
 
         # Only record timing after skipping the first N steps (warmup)
         if step_idx >= skip_timing_steps:
             timing_dict["data_prep_times"].append(data_prep_time)
             timing_dict["inference_times"].append(inference_time)
+
+        # Prepare for next iteration
+        if step_idx + 1 < len(step_counts):
+            collated_inputs, states = collated_next, states_next
 
         # Action processing
         action_chunk = parse_action_gr00t(_action_chunk)
