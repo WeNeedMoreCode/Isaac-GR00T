@@ -275,24 +275,26 @@ class Qwen3Backbone(torch.nn.Module):
         hidden_states = visual.merger(hidden_states)
         return hidden_states.squeeze(0), deepstack_feature_lists
 
-    def _ensure_lm_cache(self, vl_input: dict, inputs_embeds: torch.Tensor):
-        """Pre-compute and cache fixed values for the language model decoder loop.
+    def _preprocess_vl_input(self, vl_input: dict) -> dict:
+        """Preprocess VL input: text embedding, image encoding, position/mask/RoPE computation.
 
-        For fixed input structure (same sequence length, image positions, grid_thw),
-        position_ids, causal_mask, RoPE embeddings, and visual indices are all constant.
-        Compute once, reuse every step.
+        Compilable with torchair. Non-compilable operations (visual cache init, nonzero)
+        are pre-computed in forward() and passed via vl_input.
         """
-        if hasattr(self, '_lm_cache_initialized') and self._lm_cache_initialized:
-            return
-
         from transformers.masking_utils import create_causal_mask
 
         qwen3vl_model = self.model.model
         lm = self.model.model.language_model
 
-        image_mask = vl_input["input_ids"] == self.model.config.image_token_id
+        # 1. Text embedding
+        inputs_embeds = qwen3vl_model.get_input_embeddings()(vl_input["input_ids"])
 
-        # Position IDs
+        # 2. Image encoding
+        pixel_values = vl_input["pixel_values"].to(qwen3vl_model.visual.dtype)
+        raw_embeds, deepstack_image_embeds = self._compiled_visual_forward(pixel_values)
+        image_embeds = raw_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+
+        # 3. Position IDs
         position_ids, _ = qwen3vl_model.get_rope_index(
             vl_input["input_ids"],
             image_grid_thw=vl_input["image_grid_thw"],
@@ -306,7 +308,7 @@ class Qwen3Backbone(torch.nn.Module):
         else:
             text_position_ids = position_ids[0]
 
-        # Cache position, mask, RoPE, indices
+        # 4. Causal mask + cache position
         cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
         causal_mask = create_causal_mask(
             config=lm.config,
@@ -316,78 +318,22 @@ class Qwen3Backbone(torch.nn.Module):
             past_key_values=None,
             position_ids=text_position_ids,
         )
+
+        # 5. RoPE embeddings
         position_embeddings = lm.rotary_emb(inputs_embeds, position_ids)
-        visual_indices = image_mask[0].nonzero().squeeze(-1)
 
-        self._cached_text_position_ids = text_position_ids
-        self._cached_cache_position = cache_position
-        self._cached_causal_mask = causal_mask
-        self._cached_position_embeddings = position_embeddings
-        self._cached_visual_indices = visual_indices
-        self._cached_image_mask = image_mask
-        self._cached_image_mask_expanded = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
-
-        self._lm_cache_initialized = True
-        logger.info("Language model static values cached")
-
-    def _preprocess_vl_input(self, vl_input: dict) -> dict:
-        """Run all data-dependent preprocessing (image encoding, embedding, position_ids,
-        causal mask, RoPE embeddings, and visual indices).
-
-        All operations here are data-dependent and must run eagerly (not compiled).
-        """
-        import time
-
-        qwen3vl_model = self.model.model
-        lm = self.model.model.language_model
-
-        # 1. Text embedding
-        t0 = time.time()
-        inputs_embeds = qwen3vl_model.get_input_embeddings()(vl_input["input_ids"])
-        t_text = time.time() - t0
-
-        # 2. Image encoding (use compiled visual forward with cached statics)
-        t0 = time.time()
-        self._ensure_visual_cache()
-        pixel_values = vl_input["pixel_values"].to(self.model.model.visual.dtype)
-        t_prep = time.time() - t0
-
-        t0 = time.time()
-        raw_embeds, deepstack_image_embeds = self._compiled_visual_forward(pixel_values)
-        t_visual = time.time() - t0
-
-        t0 = time.time()
-        image_embeds_list = torch.split(raw_embeds, self._cached_visual_split_sizes)
-        image_embeds = torch.cat(image_embeds_list, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-
-        # 3. Cache fixed LM values on first call, then reuse
-        self._ensure_lm_cache(vl_input, inputs_embeds)
-
-        # 4. Scatter image embeddings into text embedding (per-step, values change)
-        inputs_embeds = inputs_embeds.masked_scatter(
-            self._cached_image_mask_expanded.to(inputs_embeds.device), image_embeds
-        )
-
-        t_post = time.time() - t0
-        if not hasattr(self, '_profile_printed'):
-            self._profile_printed = False
-        if self._profile_printed:
-            self._profile_counter = getattr(self, '_profile_counter', 0) + 1
-            if self._profile_counter <= 3:
-                print(f"[PROF] preprocess: text_embed={t_text*1000:.1f}ms  prep={t_prep*1000:.1f}ms  "
-                      f"visual={t_visual*1000:.1f}ms  post={t_post*1000:.1f}ms  "
-                      f"total_pre={(t_text+t_prep+t_visual+t_post)*1000:.1f}ms")
-        else:
-            self._profile_printed = True
+        # 6. Scatter image embeddings into text embedding
+        image_mask_expanded = vl_input["image_mask"].unsqueeze(-1).expand_as(inputs_embeds)
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask_expanded, image_embeds)
 
         return {
             "inputs_embeds": inputs_embeds,
-            "causal_mask": self._cached_causal_mask,
-            "text_position_ids": self._cached_text_position_ids,
-            "cache_position": self._cached_cache_position,
-            "position_embeddings": self._cached_position_embeddings,
+            "causal_mask": causal_mask,
+            "text_position_ids": text_position_ids,
+            "cache_position": cache_position,
+            "position_embeddings": position_embeddings,
             "deepstack_visual_embeds": deepstack_image_embeds,
-            "visual_indices": self._cached_visual_indices,
+            "visual_indices": vl_input["visual_indices"],
         }
 
     def _language_model_forward(self, **kwargs) -> torch.Tensor:
@@ -437,24 +383,34 @@ class Qwen3Backbone(torch.nn.Module):
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
 
-        # Step 1: data-dependent preprocessing (eager, not compiled)
-        t_total = time.time()
-        lm_kwargs = self._preprocess_vl_input(vl_input)
-        t_preprocess = time.time() - t_total
+        # Step 0: Ensure visual cache (eager, not compilable)
+        self._ensure_visual_cache()
 
-        # Step 2: language model (compilable with torchair)
+        # Step 1: Pre-compute non-compilable values (nonzero has dynamic output shape)
+        image_mask = vl_input["input_ids"] == self.model.config.image_token_id
+        visual_indices = image_mask[0].nonzero().squeeze(-1)
+        vl_input["visual_indices"] = visual_indices
+        vl_input["image_mask"] = image_mask
+
+        # Step 2: Preprocess (compilable with torchair)
+        t0 = time.time()
+        lm_kwargs = self._preprocess_vl_input(vl_input)
+        t_preprocess = time.time() - t0
+
+        # Step 3: Language model (compilable with torchair)
         t0 = time.time()
         hidden_states = self._language_model_forward(**lm_kwargs)
         t_lm = time.time() - t0
 
-        # Step 3: output processing (use cached masks)
-        image_mask = self._cached_image_mask
+        # Step 4: Output processing
         attention_mask = vl_input["attention_mask"] == 1
 
-        t_total = time.time() - t_total
-        if hasattr(self, '_profile_counter') and self._profile_counter <= 3:
-            print(f"[PROF] backbone_total={t_total*1000:.1f}ms  "
-                  f"preprocess={t_preprocess*1000:.1f}ms  lm={t_lm*1000:.1f}ms")
+        if not hasattr(self, '_prof_step'):
+            self._prof_step = 0
+        self._prof_step += 1
+        if self._prof_step <= 4:
+            print(f"[PROF] backbone: preprocess={t_preprocess*1000:.1f}ms  "
+                  f"lm={t_lm*1000:.1f}ms  total={((t_preprocess+t_lm)*1000):.1f}ms")
 
         return BatchFeature(
             data={
@@ -462,4 +418,4 @@ class Qwen3Backbone(torch.nn.Module):
                 "backbone_attention_mask": attention_mask,
                 "image_mask": image_mask,
             }
-        )  # [B, T2, hidden_size]
+        )

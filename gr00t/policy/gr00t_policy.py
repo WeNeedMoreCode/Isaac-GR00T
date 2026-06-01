@@ -142,7 +142,7 @@ class Gr00tPolicy(BasePolicy):
 
             format_cast_to_nz(model)
             if syx_compile >= 2:
-                compile_for_npu(model.backbone, "_compiled_visual_forward")
+                compile_for_npu(model.backbone, "_preprocess_vl_input")
             compile_for_npu(model.backbone, "_language_model_forward")
             compile_for_npu(model.action_head.model, "forward")
 
