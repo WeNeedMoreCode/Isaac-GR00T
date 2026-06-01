@@ -275,6 +275,61 @@ class Qwen3Backbone(torch.nn.Module):
         hidden_states = visual.merger(hidden_states)
         return hidden_states.squeeze(0), deepstack_feature_lists
 
+    def _ensure_lm_cache(self, vl_input: dict, inputs_embeds: torch.Tensor):
+        """Pre-compute and cache fixed values for the language model decoder loop.
+
+        For fixed input structure (same sequence length, image positions, grid_thw),
+        position_ids, causal_mask, RoPE embeddings, and visual indices are all constant.
+        Compute once, reuse every step.
+        """
+        if hasattr(self, '_lm_cache_initialized') and self._lm_cache_initialized:
+            return
+
+        from transformers.masking_utils import create_causal_mask
+
+        qwen3vl_model = self.model.model
+        lm = self.model.model.language_model
+
+        image_mask = vl_input["input_ids"] == self.model.config.image_token_id
+
+        # Position IDs
+        position_ids, _ = qwen3vl_model.get_rope_index(
+            vl_input["input_ids"],
+            image_grid_thw=vl_input["image_grid_thw"],
+            attention_mask=vl_input["attention_mask"],
+        )
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+        if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+            text_position_ids = position_ids[0]
+            position_ids = position_ids[1:]
+        else:
+            text_position_ids = position_ids[0]
+
+        # Cache position, mask, RoPE, indices
+        cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
+        causal_mask = create_causal_mask(
+            config=lm.config,
+            input_embeds=inputs_embeds,
+            attention_mask=vl_input["attention_mask"],
+            cache_position=cache_position,
+            past_key_values=None,
+            position_ids=text_position_ids,
+        )
+        position_embeddings = lm.rotary_emb(inputs_embeds, position_ids)
+        visual_indices = image_mask[0].nonzero().squeeze(-1)
+
+        self._cached_text_position_ids = text_position_ids
+        self._cached_cache_position = cache_position
+        self._cached_causal_mask = causal_mask
+        self._cached_position_embeddings = position_embeddings
+        self._cached_visual_indices = visual_indices
+        self._cached_image_mask = image_mask
+        self._cached_image_mask_expanded = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
+
+        self._lm_cache_initialized = True
+        logger.info("Language model static values cached")
+
     def _preprocess_vl_input(self, vl_input: dict) -> dict:
         """Run all data-dependent preprocessing (image encoding, embedding, position_ids,
         causal mask, RoPE embeddings, and visual indices).
@@ -282,9 +337,8 @@ class Qwen3Backbone(torch.nn.Module):
         All operations here are data-dependent and must run eagerly (not compiled).
         """
         import time
-        from transformers.masking_utils import create_causal_mask
 
-        qwen3vl_model = self.model.model  # Qwen3VLModel
+        qwen3vl_model = self.model.model
         lm = self.model.model.language_model
 
         # 1. Text embedding
@@ -306,44 +360,13 @@ class Qwen3Backbone(torch.nn.Module):
         image_embeds_list = torch.split(raw_embeds, self._cached_visual_split_sizes)
         image_embeds = torch.cat(image_embeds_list, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
 
-        # 3. Scatter image embeddings into text embedding
-        image_mask = vl_input["input_ids"] == self.model.config.image_token_id
-        image_mask_expanded = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-        inputs_embeds = inputs_embeds.masked_scatter(image_mask_expanded, image_embeds)
+        # 3. Cache fixed LM values on first call, then reuse
+        self._ensure_lm_cache(vl_input, inputs_embeds)
 
-        # 4. Visual position masks and deepstack features
-        visual_pos_masks = image_mask
-        deepstack_visual_embeds = deepstack_image_embeds
-
-        # 5. Compute position_ids (data-dependent)
-        position_ids, rope_deltas = qwen3vl_model.get_rope_index(
-            vl_input["input_ids"],
-            image_grid_thw=vl_input["image_grid_thw"],
-            attention_mask=vl_input["attention_mask"],
+        # 4. Scatter image embeddings into text embedding (per-step, values change)
+        inputs_embeds = inputs_embeds.masked_scatter(
+            self._cached_image_mask_expanded.to(inputs_embeds.device), image_embeds
         )
-
-        # 6. Pre-compute items needed by the decoder loop
-        if position_ids.ndim == 2:
-            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
-        if position_ids.ndim == 3 and position_ids.shape[0] == 4:
-            text_position_ids = position_ids[0]
-            position_ids = position_ids[1:]
-        else:
-            text_position_ids = position_ids[0]
-
-        cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
-        causal_mask = create_causal_mask(
-            config=lm.config,
-            input_embeds=inputs_embeds,
-            attention_mask=vl_input["attention_mask"],
-            cache_position=cache_position,
-            past_key_values=None,
-            position_ids=text_position_ids,
-        )
-
-        position_embeddings = lm.rotary_emb(inputs_embeds, position_ids)
-
-        visual_indices = visual_pos_masks[0].nonzero().squeeze(-1)
 
         t_post = time.time() - t0
         if not hasattr(self, '_profile_printed'):
@@ -359,12 +382,12 @@ class Qwen3Backbone(torch.nn.Module):
 
         return {
             "inputs_embeds": inputs_embeds,
-            "causal_mask": causal_mask,
-            "text_position_ids": text_position_ids,
-            "cache_position": cache_position,
-            "position_embeddings": position_embeddings,
-            "deepstack_visual_embeds": deepstack_visual_embeds,
-            "visual_indices": visual_indices,
+            "causal_mask": self._cached_causal_mask,
+            "text_position_ids": self._cached_text_position_ids,
+            "cache_position": self._cached_cache_position,
+            "position_embeddings": self._cached_position_embeddings,
+            "deepstack_visual_embeds": deepstack_image_embeds,
+            "visual_indices": self._cached_visual_indices,
         }
 
     def _language_model_forward(self, **kwargs) -> torch.Tensor:
@@ -424,8 +447,8 @@ class Qwen3Backbone(torch.nn.Module):
         hidden_states = self._language_model_forward(**lm_kwargs)
         t_lm = time.time() - t0
 
-        # Step 3: output processing
-        image_mask = vl_input["input_ids"] == self.model.config.image_token_id
+        # Step 3: output processing (use cached masks)
+        image_mask = self._cached_image_mask
         attention_mask = vl_input["attention_mask"] == 1
 
         t_total = time.time() - t_total

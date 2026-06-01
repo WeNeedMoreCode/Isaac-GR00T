@@ -23,10 +23,8 @@ This module provides the core policy classes for running Gr00t models:
 from pathlib import Path
 from typing import Any
 
-# NPU torchair compilation toggle: set to 1 to enable, 0 to disable
+# NPU torchair compilation toggle: 0=disable, 1=compile LM+action_head, 2=compile all (visual+LM+action_head)
 syx_compile = 0
-syx_load = True  # Load saved model inputs from file (for cross-platform precision comparison)
-compile_visual = False  # compile the full visual encoder
 
 import numpy as np
 import torch
@@ -116,7 +114,7 @@ class Gr00tPolicy(BasePolicy):
             model = model.to(device=device, dtype=torch.float16)
             # Conv3D lacks a precompiled kernel under jit_compile=False.
             # Needed when patch_embed runs in eager mode (not compiled by torchair).
-            if not compile_visual:
+            if syx_compile < 2:
                 try:
                     patch_embed = model.backbone.model.model.visual.patch_embed
                     _orig_forward = patch_embed.forward
@@ -143,7 +141,7 @@ class Gr00tPolicy(BasePolicy):
             from gr00t.model.npu_utils import compile_for_npu, format_cast_to_nz
 
             format_cast_to_nz(model)
-            if compile_visual:
+            if syx_compile >= 2:
                 compile_for_npu(model.backbone, "_compiled_visual_forward")
             compile_for_npu(model.backbone, "_language_model_forward")
             compile_for_npu(model.action_head.model, "forward")
@@ -452,20 +450,6 @@ class Gr00tPolicy(BasePolicy):
         t_collate = time.time()
         collated_inputs = self.collate_fn(processed_inputs)
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.float16)
-
-        # Load saved inputs for cross-platform comparison
-        if syx_load:
-            import os
-            save_dir = "syx_saved_inputs"
-            if not hasattr(self, '_syx_step_counter'):
-                self._syx_step_counter = 0
-            load_path = os.path.join(save_dir, f"step{self._syx_step_counter}.pt")
-            if os.path.exists(load_path):
-                collated_inputs = torch.load(load_path, map_location=self.model.device)
-                print(f"[SYX_LOAD] loaded {load_path}")
-            else:
-                print(f"[SYX_LOAD] {load_path} not found, using real data")
-            self._syx_step_counter += 1
         t_collate = time.time() - t_collate
 
         # Step 4: Run model inference to predict actions
