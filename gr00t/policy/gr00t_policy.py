@@ -202,7 +202,7 @@ class Gr00tPolicy(BasePolicy):
         }
         self.collate_fn = self.processor.collator
 
-        # Precompute NPU-side action denormalization tensors
+        # Precompute action denormalization parameters
         self._init_action_denorm(device)
 
         # Extract and validate language configuration
@@ -239,8 +239,8 @@ class Gr00tPolicy(BasePolicy):
                 scale = range_v / 2.0
                 offset = min_v + range_v / 2.0
             self._action_denorm_groups.append({
-                "scale": scale,  # keep as numpy
-                "offset": offset,  # keep as numpy
+                "scale": scale,
+                "offset": offset,
                 "start": start_idx,
                 "end": start_idx + joint_dim,
             })
@@ -486,16 +486,15 @@ class Gr00tPolicy(BasePolicy):
         if _prof:
             t0 = time.time()
         action_pred = model_pred["action_pred"]
-        # Transfer to CPU first (NZ format on NPU causes wrong slice results)
         action_np = action_pred.float().cpu().numpy()
         action_horizon = len(self.modality_configs["action"].delta_indices)
 
-        # CPU denormalization with precomputed scale/offset (avoids slow processor loops)
+        # CPU denormalization with precomputed scale/offset
         casted_action = {}
         for i, key in enumerate(self.modality_configs["action"].modality_keys):
             grp = self._action_denorm_groups[i]
             s, e = grp["start"], grp["end"]
-            group_slice = action_np[..., :action_horizon, s:e]
+            group_slice = np.clip(action_np[..., :action_horizon, s:e], -1.0, 1.0)
             casted_action[key] = (group_slice * grp["scale"] + grp["offset"]).astype(np.float32)
         if _prof:
             t_decode = time.time() - t0
@@ -507,14 +506,28 @@ class Gr00tPolicy(BasePolicy):
         if self._verify_step <= 3:
             batched_states = {}
             for k in self.modality_configs["state"].modality_keys:
-                batched_states[k] = np.stack([s[k] for s in states], axis=0)
+                batched_states[k] = np.stack([s[k] for k_mod in [k] for s in states], axis=0)
             old_result = self.processor.decode_action(
                 action_np, self.embodiment_tag, batched_states
             )
             old_result = {k: v.astype(np.float32) for k, v in old_result.items()}
-            for key in casted_action:
+
+            if self._verify_step == 1:
+                key = "joint_position"
+                grp = self._action_denorm_groups[2]
+                s, e = grp["start"], grp["end"]
+                print(f"[VERIFY] action_np[{s}:{e}] t=0: {action_np[0, 0, s:s+3]}")
+                print(f"[VERIFY] old_result:  {old_result[key][0, 0, :3]}")
+                print(f"[VERIFY] my_result:   {casted_action[key][0, 0, :3]}")
+                print(f"[VERIFY] action_np.shape: {action_np.shape}")
+                print(f"[VERIFY] old_result.shape: {old_result[key].shape}")
+                print(f"[VERIFY] my_result.shape:  {casted_action[key].shape}")
+                params = self.processor.state_action_processor.norm_params[
+                    self.embodiment_tag.value]["action"][key]
+                print(f"[VERIFY] min[0,:3]: {params['min'][0, :3]}")
+                print(f"[VERIFY] max[0,:3]: {params['max'][0, :3]}")
                 diff = np.abs(old_result[key] - casted_action[key]).max()
-                print(f"[VERIFY] step={self._verify_step} key={key} max_diff={diff:.6f}")
+                print(f"[VERIFY] max_diff: {diff:.6f}")
 
         if _prof:
             if not hasattr(self, '_prof_decode_step'):
