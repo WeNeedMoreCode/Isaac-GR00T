@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 # NPU torchair compilation toggle: 0=disable, 1=compile LM+action_head, 2=compile all (visual+LM+action_head)
-syx_compile = 0
+syx_compile = 2
 
 import numpy as np
 import torch
@@ -444,17 +444,50 @@ class Gr00tPolicy(BasePolicy):
 
     def decode_action(self, model_pred: dict, states: list[dict]):
         """Wait for NPU, decode and unnormalize actions."""
-        normalized_action = model_pred["action_pred"].float()
+        import time
+        _prof = getattr(self, '_enable_profiling', False)
 
+        if _prof:
+            t0 = time.time()
+        normalized_action = model_pred["action_pred"].float()
+        if _prof:
+            t_float = time.time() - t0
+
+        if _prof:
+            t0 = time.time()
         batched_states = {}
         for k in self.modality_configs["state"].modality_keys:
             batched_states[k] = np.stack([s[k] for s in states], axis=0)
+        if _prof:
+            t_stack = time.time() - t0
+
+        if _prof:
+            t0 = time.time()
         unnormalized_action = self.processor.decode_action(
             normalized_action.cpu().numpy(), self.embodiment_tag, batched_states
         )
+        if _prof:
+            t_decode = time.time() - t0
+
+        if _prof:
+            t0 = time.time()
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
+        if _prof:
+            t_cast = time.time() - t0
+
+        if _prof:
+            if not hasattr(self, '_prof_decode_step'):
+                self._prof_decode_step = 0
+            self._prof_decode_step += 1
+            if self._prof_decode_step <= 4:
+                print(f"[PROF] decode: float(sync)={t_float*1000:.1f}ms  "
+                      f"stack={t_stack*1000:.1f}ms  "
+                      f"decode_action={t_decode*1000:.1f}ms  "
+                      f"cast={t_cast*1000:.1f}ms  "
+                      f"total={(t_float+t_stack+t_decode+t_cast)*1000:.1f}ms")
+
         return casted_action, {}
 
     def _get_action(

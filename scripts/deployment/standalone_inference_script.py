@@ -491,9 +491,6 @@ def run_single_trajectory(
             )
             pred_action_across_time.append(concat_pred_action)
 
-    # Clean up thread pool
-    executor.shutdown(wait=True)
-
     logging.info("\n" + "-" * 80)
     logging.info(f"All inference steps completed for current trajectory-id {traj_id}")
 
@@ -616,6 +613,9 @@ class ArgsConfig:
     denoising_steps: int = 4
     """Number of denoising steps to use."""
 
+    profile: bool = False
+    """Enable per-step profiling output (backbone/action_head timing breakdown)."""
+
     save_plot_path: str | None = None
     """Path to save the plot to."""
 
@@ -691,6 +691,19 @@ def main(args: ArgsConfig):
         model_path=local_model_path,
         device=args.device,
     )
+
+    # Override denoising steps if specified
+    if args.denoising_steps != 4:
+        policy.model.action_head.num_inference_timesteps = args.denoising_steps
+        logging.info(f"Denoising steps overridden to: {args.denoising_steps}")
+    logging.info(f"Actual num_inference_timesteps: {policy.model.action_head.num_inference_timesteps}")
+
+    # Enable profiling on model classes if requested
+    if args.profile:
+        policy.model._enable_profiling = True
+        policy.model.backbone._enable_profiling = True
+        policy._enable_profiling = True
+        logging.info("Profiling enabled")
 
     # Apply inference mode
     if args.inference_mode == "trt_full_pipeline":
