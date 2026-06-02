@@ -224,23 +224,27 @@ class Gr00tPolicy(BasePolicy):
         joint_groups = action_modality.modality_keys
         mean_std_keys = action_modality.mean_std_embedding_keys
 
-        scales, offsets = [], []
+        self._action_denorm_groups = []
+        start_idx = 0
         for key in joint_groups:
             params = norm_params[emb]["action"][key]
+            joint_dim = params["dim"].item()
             if mean_std_keys is not None and key in mean_std_keys:
-                scales.append(params["std"])
-                offsets.append(params["mean"])
+                scale = params["std"]
+                offset = params["mean"]
             else:
                 min_v = params["min"]
                 max_v = params["max"]
                 range_v = max_v - min_v
-                scales.append(range_v / 2.0)
-                offsets.append(min_v + range_v / 2.0)
-
-        scale = np.concatenate(scales)
-        offset = np.concatenate(offsets)
-        self._action_scale = torch.tensor(scale, dtype=torch.float32, device=device)
-        self._action_offset = torch.tensor(offset, dtype=torch.float32, device=device)
+                scale = range_v / 2.0
+                offset = min_v + range_v / 2.0
+            self._action_denorm_groups.append({
+                "scale": torch.tensor(scale, dtype=torch.float32, device=device),
+                "offset": torch.tensor(offset, dtype=torch.float32, device=device),
+                "start": start_idx,
+                "end": start_idx + joint_dim,
+            })
+            start_idx += joint_dim
 
     def _unbatch_observation(self, value: dict[str, Any]) -> list[dict[str, Any]]:
         """Unbatch a batched observation into a list of single observations.
@@ -481,39 +485,35 @@ class Gr00tPolicy(BasePolicy):
 
         if _prof:
             t0 = time.time()
-        action_pred = model_pred["action_pred"]
-        # NPU-side denormalization: x * scale + offset
-        action_pred = action_pred.float() * self._action_scale + self._action_offset
+        action_pred = model_pred["action_pred"].float()
+        # NPU-side denormalization per joint group
+        action_horizon = len(self.modality_configs["action"].delta_indices)
+        denormed = torch.empty_like(action_pred[..., :action_horizon, :])
+        for grp in self._action_denorm_groups:
+            s, e = grp["start"], grp["end"]
+            denormed[..., s:e] = action_pred[..., s:e] * grp["scale"] + grp["offset"]
         if _prof:
             t_denorm = time.time() - t0
 
         if _prof:
             t0 = time.time()
-        action_np = action_pred.cpu().numpy()
-        # Split into joint groups (same logic as processor.decode_action)
-        action_modality = self.modality_configs["action"]
-        joint_groups = action_modality.modality_keys
-        action_horizon = len(action_modality.delta_indices)
+        action_np = denormed.cpu().numpy()
         casted_action = {}
-        start_idx = 0
-        for key in joint_groups:
-            joint_dim = self._action_scale.shape[0] if start_idx == 0 else 0
-            # Get dim from processor's norm_params
-            norm_params = self.processor.state_action_processor.norm_params
-            joint_dim = norm_params[self.embodiment_tag.value]["action"][key]["dim"].item()
-            casted_action[key] = action_np[..., :action_horizon, start_idx:start_idx + joint_dim].astype(np.float32)
-            start_idx += joint_dim
+        for i, key in enumerate(self.modality_configs["action"].modality_keys):
+            grp = self._action_denorm_groups[i]
+            s, e = grp["start"], grp["end"]
+            casted_action[key] = action_np[..., s:e].astype(np.float32)
         if _prof:
-            t_split = time.time() - t0
+            t_transfer = time.time() - t0
 
         if _prof:
             if not hasattr(self, '_prof_decode_step'):
                 self._prof_decode_step = 0
             self._prof_decode_step += 1
             if self._prof_decode_step <= 4:
-                print(f"[PROF] decode: denorm(sync+compute)={t_denorm*1000:.1f}ms  "
-                      f"split+cast={t_split*1000:.1f}ms  "
-                      f"total={(t_denorm+t_split)*1000:.1f}ms")
+                print(f"[PROF] decode: denorm(sync)={t_denorm*1000:.1f}ms  "
+                      f"transfer+split={t_transfer*1000:.1f}ms  "
+                      f"total={(t_denorm+t_transfer)*1000:.1f}ms")
 
         return casted_action, {}
 
