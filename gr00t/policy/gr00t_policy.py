@@ -215,7 +215,7 @@ class Gr00tPolicy(BasePolicy):
         self.language_key = language_keys[0]
 
     def _init_action_denorm(self, device):
-        """Precompute scale/offset tensors for NPU-side action denormalization."""
+        """Precompute scale/offset arrays for action denormalization."""
         import numpy as np
 
         norm_params = self.processor.state_action_processor.norm_params
@@ -239,8 +239,8 @@ class Gr00tPolicy(BasePolicy):
                 scale = range_v / 2.0
                 offset = min_v + range_v / 2.0
             self._action_denorm_groups.append({
-                "scale": torch.tensor(scale, dtype=torch.float32, device=device),
-                "offset": torch.tensor(offset, dtype=torch.float32, device=device),
+                "scale": scale,  # keep as numpy
+                "offset": offset,  # keep as numpy
                 "start": start_idx,
                 "end": start_idx + joint_dim,
             })
@@ -486,59 +486,42 @@ class Gr00tPolicy(BasePolicy):
         if _prof:
             t0 = time.time()
         action_pred = model_pred["action_pred"]
-        normalized_np = action_pred.float().cpu().numpy()
-        action_fp32 = action_pred.float()
+        # Transfer to CPU first (NZ format on NPU causes wrong slice results)
+        action_np = action_pred.float().cpu().numpy()
+        action_horizon = len(self.modality_configs["action"].delta_indices)
 
-        # NPU-side denormalization per joint group
+        # CPU denormalization with precomputed scale/offset (avoids slow processor loops)
         casted_action = {}
         for i, key in enumerate(self.modality_configs["action"].modality_keys):
             grp = self._action_denorm_groups[i]
             s, e = grp["start"], grp["end"]
-            denormed = action_fp32[..., s:e] * grp["scale"] + grp["offset"]
-            casted_action[key] = denormed.cpu().numpy().astype(np.float32)
+            group_slice = action_np[..., :action_horizon, s:e]
+            casted_action[key] = (group_slice * grp["scale"] + grp["offset"]).astype(np.float32)
         if _prof:
-            t_denorm = time.time() - t0
+            t_decode = time.time() - t0
 
-        # Verification: compare with original CPU denormalization
+        # Verification
         if not hasattr(self, '_verify_step'):
             self._verify_step = 0
         self._verify_step += 1
         if self._verify_step <= 3:
-            # Check which groups use meanstd vs minmax
-            mean_std_keys = self.modality_configs["action"].mean_std_embedding_keys
-            print(f"[VERIFY] mean_std_embedding_keys = {mean_std_keys}")
-            for i, key in enumerate(self.modality_configs["action"].modality_keys):
-                grp = self._action_denorm_groups[i]
-                norm_params = self.processor.state_action_processor.norm_params
-                params = norm_params[self.embodiment_tag.value]["action"][key]
-                is_meanstd = mean_std_keys is not None and key in mean_std_keys
-                print(f"[VERIFY] key={key} s={grp['start']} e={grp['end']} "
-                      f"use_meanstd={is_meanstd} "
-                      f"scale_shape={grp['scale'].shape} scale_range=[{grp['scale'].min():.4f},{grp['scale'].max():.4f}] "
-                      f"offset_range=[{grp['offset'].min():.4f},{grp['offset'].max():.4f}]")
-
             batched_states = {}
             for k in self.modality_configs["state"].modality_keys:
                 batched_states[k] = np.stack([s[k] for s in states], axis=0)
             old_result = self.processor.decode_action(
-                normalized_np, self.embodiment_tag, batched_states
+                action_np, self.embodiment_tag, batched_states
             )
             old_result = {k: v.astype(np.float32) for k, v in old_result.items()}
             for key in casted_action:
-                old_v = old_result[key]
-                new_v = casted_action[key]
-                diff = np.abs(old_v - new_v).max()
-                print(f"[VERIFY] step={self._verify_step} key={key} "
-                      f"old=[{old_v.min():.4f},{old_v.max():.4f}] "
-                      f"new=[{new_v.min():.4f},{new_v.max():.4f}] "
-                      f"max_diff={diff:.6f}")
+                diff = np.abs(old_result[key] - casted_action[key]).max()
+                print(f"[VERIFY] step={self._verify_step} key={key} max_diff={diff:.6f}")
 
         if _prof:
             if not hasattr(self, '_prof_decode_step'):
                 self._prof_decode_step = 0
             self._prof_decode_step += 1
             if self._prof_decode_step <= 4:
-                print(f"[PROF] decode: denorm(sync+compute)={t_denorm*1000:.1f}ms  ")
+                print(f"[PROF] decode: total={t_decode*1000:.1f}ms")
 
         return casted_action, {}
 
