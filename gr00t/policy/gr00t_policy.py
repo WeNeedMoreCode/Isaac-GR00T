@@ -202,6 +202,9 @@ class Gr00tPolicy(BasePolicy):
         }
         self.collate_fn = self.processor.collator
 
+        # Precompute NPU-side action denormalization tensors
+        self._init_action_denorm(device)
+
         # Extract and validate language configuration
         # Some embodiments (e.g. OXE_DROID) define multiple language keys for
         # training-time augmentation (paraphrases). At inference we only use the first key.
@@ -210,6 +213,34 @@ class Gr00tPolicy(BasePolicy):
         assert len(language_keys) >= 1, "At least one language key is required"
         assert len(language_delta_indices) == 1, "Only one language delta index is supported"
         self.language_key = language_keys[0]
+
+    def _init_action_denorm(self, device):
+        """Precompute scale/offset tensors for NPU-side action denormalization."""
+        import numpy as np
+
+        norm_params = self.processor.state_action_processor.norm_params
+        emb = self.embodiment_tag.value
+        action_modality = self.modality_configs["action"]
+        joint_groups = action_modality.modality_keys
+        mean_std_keys = action_modality.mean_std_embedding_keys
+
+        scales, offsets = [], []
+        for key in joint_groups:
+            params = norm_params[emb]["action"][key]
+            if mean_std_keys is not None and key in mean_std_keys:
+                scales.append(params["std"])
+                offsets.append(params["mean"])
+            else:
+                min_v = params["min"]
+                max_v = params["max"]
+                range_v = max_v - min_v
+                scales.append(range_v / 2.0)
+                offsets.append(min_v + range_v / 2.0)
+
+        scale = np.concatenate(scales)
+        offset = np.concatenate(offsets)
+        self._action_scale = torch.tensor(scale, dtype=torch.float32, device=device)
+        self._action_offset = torch.tensor(offset, dtype=torch.float32, device=device)
 
     def _unbatch_observation(self, value: dict[str, Any]) -> list[dict[str, Any]]:
         """Unbatch a batched observation into a list of single observations.
@@ -445,48 +476,44 @@ class Gr00tPolicy(BasePolicy):
     def decode_action(self, model_pred: dict, states: list[dict]):
         """Wait for NPU, decode and unnormalize actions."""
         import time
+        import numpy as np
         _prof = getattr(self, '_enable_profiling', False)
 
         if _prof:
             t0 = time.time()
-        normalized_action = model_pred["action_pred"].float()
+        action_pred = model_pred["action_pred"]
+        # NPU-side denormalization: x * scale + offset
+        action_pred = action_pred.float() * self._action_scale + self._action_offset
         if _prof:
-            t_float = time.time() - t0
+            t_denorm = time.time() - t0
 
         if _prof:
             t0 = time.time()
-        batched_states = {}
-        for k in self.modality_configs["state"].modality_keys:
-            batched_states[k] = np.stack([s[k] for s in states], axis=0)
+        action_np = action_pred.cpu().numpy()
+        # Split into joint groups (same logic as processor.decode_action)
+        action_modality = self.modality_configs["action"]
+        joint_groups = action_modality.modality_keys
+        action_horizon = len(action_modality.delta_indices)
+        casted_action = {}
+        start_idx = 0
+        for key in joint_groups:
+            joint_dim = self._action_scale.shape[0] if start_idx == 0 else 0
+            # Get dim from processor's norm_params
+            norm_params = self.processor.state_action_processor.norm_params
+            joint_dim = norm_params[self.embodiment_tag.value]["action"][key]["dim"].item()
+            casted_action[key] = action_np[..., :action_horizon, start_idx:start_idx + joint_dim].astype(np.float32)
+            start_idx += joint_dim
         if _prof:
-            t_stack = time.time() - t0
-
-        if _prof:
-            t0 = time.time()
-        unnormalized_action = self.processor.decode_action(
-            normalized_action.cpu().numpy(), self.embodiment_tag, batched_states
-        )
-        if _prof:
-            t_decode = time.time() - t0
-
-        if _prof:
-            t0 = time.time()
-        casted_action = {
-            key: value.astype(np.float32) for key, value in unnormalized_action.items()
-        }
-        if _prof:
-            t_cast = time.time() - t0
+            t_split = time.time() - t0
 
         if _prof:
             if not hasattr(self, '_prof_decode_step'):
                 self._prof_decode_step = 0
             self._prof_decode_step += 1
             if self._prof_decode_step <= 4:
-                print(f"[PROF] decode: float(sync)={t_float*1000:.1f}ms  "
-                      f"stack={t_stack*1000:.1f}ms  "
-                      f"decode_action={t_decode*1000:.1f}ms  "
-                      f"cast={t_cast*1000:.1f}ms  "
-                      f"total={(t_float+t_stack+t_decode+t_cast)*1000:.1f}ms")
+                print(f"[PROF] decode: denorm(sync+compute)={t_denorm*1000:.1f}ms  "
+                      f"split+cast={t_split*1000:.1f}ms  "
+                      f"total={(t_denorm+t_split)*1000:.1f}ms")
 
         return casted_action, {}
 
