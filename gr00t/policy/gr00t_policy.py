@@ -485,35 +485,47 @@ class Gr00tPolicy(BasePolicy):
 
         if _prof:
             t0 = time.time()
-        action_pred = model_pred["action_pred"].float()
-        # NPU-side denormalization per joint group
-        action_horizon = len(self.modality_configs["action"].delta_indices)
-        denormed = torch.empty_like(action_pred[..., :action_horizon, :])
-        for grp in self._action_denorm_groups:
-            s, e = grp["start"], grp["end"]
-            denormed[..., s:e] = action_pred[..., s:e] * grp["scale"] + grp["offset"]
-        if _prof:
-            t_denorm = time.time() - t0
+        action_pred = model_pred["action_pred"]
+        normalized_np = action_pred.float().cpu().numpy()
+        action_fp32 = action_pred.float()
 
-        if _prof:
-            t0 = time.time()
-        action_np = denormed.cpu().numpy()
+        # NPU-side denormalization per joint group
         casted_action = {}
         for i, key in enumerate(self.modality_configs["action"].modality_keys):
             grp = self._action_denorm_groups[i]
             s, e = grp["start"], grp["end"]
-            casted_action[key] = action_np[..., s:e].astype(np.float32)
+            denormed = action_fp32[..., s:e] * grp["scale"] + grp["offset"]
+            casted_action[key] = denormed.cpu().numpy().astype(np.float32)
         if _prof:
-            t_transfer = time.time() - t0
+            t_denorm = time.time() - t0
+
+        # Verification: compare with original CPU denormalization
+        if not hasattr(self, '_verify_step'):
+            self._verify_step = 0
+        self._verify_step += 1
+        if self._verify_step <= 3:
+            batched_states = {}
+            for k in self.modality_configs["state"].modality_keys:
+                batched_states[k] = np.stack([s[k] for s in states], axis=0)
+            old_result = self.processor.decode_action(
+                normalized_np, self.embodiment_tag, batched_states
+            )
+            old_result = {k: v.astype(np.float32) for k, v in old_result.items()}
+            for key in casted_action:
+                old_v = old_result[key]
+                new_v = casted_action[key]
+                diff = np.abs(old_v - new_v).max()
+                print(f"[VERIFY] step={self._verify_step} key={key} "
+                      f"old=[{old_v.min():.4f},{old_v.max():.4f}] "
+                      f"new=[{new_v.min():.4f},{new_v.max():.4f}] "
+                      f"max_diff={diff:.6f} shape_old={old_v.shape} shape_new={new_v.shape}")
 
         if _prof:
             if not hasattr(self, '_prof_decode_step'):
                 self._prof_decode_step = 0
             self._prof_decode_step += 1
             if self._prof_decode_step <= 4:
-                print(f"[PROF] decode: denorm(sync)={t_denorm*1000:.1f}ms  "
-                      f"transfer+split={t_transfer*1000:.1f}ms  "
-                      f"total={(t_denorm+t_transfer)*1000:.1f}ms")
+                print(f"[PROF] decode: denorm(sync+compute)={t_denorm*1000:.1f}ms  ")
 
         return casted_action, {}
 
