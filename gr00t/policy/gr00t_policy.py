@@ -504,6 +504,19 @@ class Gr00tPolicy(BasePolicy):
             self._verify_step = 0
         self._verify_step += 1
         if self._verify_step <= 3:
+            # Check which groups use meanstd vs minmax
+            mean_std_keys = self.modality_configs["action"].mean_std_embedding_keys
+            print(f"[VERIFY] mean_std_embedding_keys = {mean_std_keys}")
+            for i, key in enumerate(self.modality_configs["action"].modality_keys):
+                grp = self._action_denorm_groups[i]
+                norm_params = self.processor.state_action_processor.norm_params
+                params = norm_params[self.embodiment_tag.value]["action"][key]
+                is_meanstd = mean_std_keys is not None and key in mean_std_keys
+                print(f"[VERIFY] key={key} s={grp['start']} e={grp['end']} "
+                      f"use_meanstd={is_meanstd} "
+                      f"scale_shape={grp['scale'].shape} scale_range=[{grp['scale'].min():.4f},{grp['scale'].max():.4f}] "
+                      f"offset_range=[{grp['offset'].min():.4f},{grp['offset'].max():.4f}]")
+
             batched_states = {}
             for k in self.modality_configs["state"].modality_keys:
                 batched_states[k] = np.stack([s[k] for s in states], axis=0)
@@ -518,7 +531,7 @@ class Gr00tPolicy(BasePolicy):
                 print(f"[VERIFY] step={self._verify_step} key={key} "
                       f"old=[{old_v.min():.4f},{old_v.max():.4f}] "
                       f"new=[{new_v.min():.4f},{new_v.max():.4f}] "
-                      f"max_diff={diff:.6f} shape_old={old_v.shape} shape_new={new_v.shape}")
+                      f"max_diff={diff:.6f}")
 
         if _prof:
             if not hasattr(self, '_prof_decode_step'):
