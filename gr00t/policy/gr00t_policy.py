@@ -503,31 +503,33 @@ class Gr00tPolicy(BasePolicy):
         if not hasattr(self, '_verify_step'):
             self._verify_step = 0
         self._verify_step += 1
-        if self._verify_step <= 3:
+        if self._verify_step == 1:
+            key = "joint_position"
+            grp = self._action_denorm_groups[2]
+            s, e = grp["start"], grp["end"]
+            group_slice = action_np[..., :action_horizon, s:e]
+
+            # Call original function directly
+            from gr00t.data.utils import unnormalize_values_minmax
+            params = self.processor.state_action_processor.norm_params[
+                self.embodiment_tag.value]["action"][key]
+            direct = unnormalize_values_minmax(group_slice, params)
+
+            # Call processor's full pipeline
             batched_states = {}
             for k in self.modality_configs["state"].modality_keys:
-                batched_states[k] = np.stack([s[k] for k_mod in [k] for s in states], axis=0)
+                batched_states[k] = np.stack([s_val[k] for s_val in states], axis=0)
             old_result = self.processor.decode_action(
                 action_np, self.embodiment_tag, batched_states
             )
-            old_result = {k: v.astype(np.float32) for k, v in old_result.items()}
+            old_jp = old_result[key].astype(np.float32)
 
-            if self._verify_step == 1:
-                key = "joint_position"
-                grp = self._action_denorm_groups[2]
-                s, e = grp["start"], grp["end"]
-                print(f"[VERIFY] action_np[{s}:{e}] t=0: {action_np[0, 0, s:s+3]}")
-                print(f"[VERIFY] old_result:  {old_result[key][0, 0, :3]}")
-                print(f"[VERIFY] my_result:   {casted_action[key][0, 0, :3]}")
-                print(f"[VERIFY] action_np.shape: {action_np.shape}")
-                print(f"[VERIFY] old_result.shape: {old_result[key].shape}")
-                print(f"[VERIFY] my_result.shape:  {casted_action[key].shape}")
-                params = self.processor.state_action_processor.norm_params[
-                    self.embodiment_tag.value]["action"][key]
-                print(f"[VERIFY] min[0,:3]: {params['min'][0, :3]}")
-                print(f"[VERIFY] max[0,:3]: {params['max'][0, :3]}")
-                diff = np.abs(old_result[key] - casted_action[key]).max()
-                print(f"[VERIFY] max_diff: {diff:.6f}")
+            print(f"[VERIFY] raw_input[0,0,:3]: {group_slice[0, 0, :3]}")
+            print(f"[VERIFY] direct_fn[0,0,:3]: {direct[0, 0, :3]}")
+            print(f"[VERIFY] processor[0,0,:3]: {old_jp[0, 0, :3]}")
+            print(f"[VERIFY] mine[0,0,:3]:      {casted_action[key][0, 0, :3]}")
+            print(f"[VERIFY] diff_direct_vs_proc: {np.abs(direct - old_jp).max():.6f}")
+            print(f"[VERIFY] diff_direct_vs_mine: {np.abs(direct.astype(np.float32) - casted_action[key]).max():.6f}")
 
         if _prof:
             if not hasattr(self, '_prof_decode_step'):
