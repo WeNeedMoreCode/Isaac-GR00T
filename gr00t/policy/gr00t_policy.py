@@ -243,12 +243,16 @@ class Gr00tPolicy(BasePolicy):
             # Save relative action info
             is_relative = False
             state_key = key
+            action_type = None
+            action_format = None
             if action_configs is not None and use_relative:
                 acfg = action_configs[i]
                 from gr00t.data.types import ActionRepresentation
                 if acfg.rep == ActionRepresentation.RELATIVE:
                     is_relative = True
                     state_key = acfg.state_key if acfg.state_key else key
+                    action_type = acfg.type
+                    action_format = acfg.format
             self._action_denorm_groups.append({
                 "scale": scale,
                 "offset": offset,
@@ -256,6 +260,8 @@ class Gr00tPolicy(BasePolicy):
                 "end": start_idx + joint_dim,
                 "is_relative": is_relative,
                 "state_key": state_key,
+                "action_type": action_type,
+                "action_format": action_format,
             })
             start_idx += joint_dim
 
@@ -490,10 +496,63 @@ class Gr00tPolicy(BasePolicy):
         with torch.inference_mode():
             return self.model.get_action(**collated_inputs)
 
+    @staticmethod
+    def _rot6d_to_matrix_batch(rot6d: np.ndarray) -> np.ndarray:
+        """Vectorized rot6d→3x3 rotation matrix. Input (..., 6) → output (..., 3, 3)."""
+        r = rot6d.reshape(*rot6d.shape[:-1], 2, 3)
+        row1 = r[..., 0, :]
+        row2 = r[..., 1, :]
+        row1 = row1 / np.linalg.norm(row1, axis=-1, keepdims=True)
+        row2 = row2 - np.sum(row1 * row2, axis=-1, keepdims=True) * row1
+        row2 = row2 / np.linalg.norm(row2, axis=-1, keepdims=True)
+        row3 = np.cross(row1, row2)
+        return np.stack([row1, row2, row3], axis=-2)
+
+    @staticmethod
+    def _matrix_to_rot6d_batch(R: np.ndarray) -> np.ndarray:
+        """Vectorized 3x3 rotation matrix→rot6d. Input (..., 3, 3) → output (..., 6)."""
+        return R[..., :2, :].reshape(*R.shape[:-2], 6)
+
+    @staticmethod
+    def _eef_relative_to_absolute(denorm: np.ndarray, ref_state: np.ndarray) -> np.ndarray:
+        """Vectorized EEF relative→absolute via homogeneous matrix composition.
+        denorm: (B, T, 9) xyz+rot6d relative actions.
+        ref_state: (B, 9) xyz+rot6d reference state (last timestep).
+        Returns: (B, T, 9) absolute xyz+rot6d actions.
+        """
+        # Parse relative actions → rotation matrices and translations
+        rel_t = denorm[..., :3]  # (B, T, 3)
+        rel_R = Gr00tPolicy._rot6d_to_matrix_batch(denorm[..., 3:])  # (B, T, 3, 3)
+
+        # Parse reference state → rotation matrix and translation
+        ref_t = ref_state[..., :3]  # (B, 3)
+        ref_R = Gr00tPolicy._rot6d_to_matrix_batch(ref_state[..., 3:])  # (B, 3, 3)
+
+        # Build homogeneous matrices for relative: (B, T, 4, 4)
+        T_rel = np.zeros((*rel_R.shape[:-2], 4, 4), dtype=denorm.dtype)
+        T_rel[..., :3, :3] = rel_R
+        T_rel[..., :3, 3] = rel_t
+        T_rel[..., 3, 3] = 1.0
+
+        # Build homogeneous matrices for reference: (B, 4, 4)
+        T_ref = np.zeros((*ref_R.shape[:-2], 4, 4), dtype=ref_state.dtype)
+        T_ref[..., :3, :3] = ref_R
+        T_ref[..., :3, 3] = ref_t
+        T_ref[..., 3, 3] = 1.0
+
+        # Compose: T_abs = T_ref @ T_rel, broadcast over T dimension
+        T_abs = np.matmul(T_ref[:, None, :, :], T_rel)  # (B, T, 4, 4)
+
+        # Extract result
+        abs_t = T_abs[..., :3, 3].astype(np.float32)  # (B, T, 3)
+        abs_rot6d = Gr00tPolicy._matrix_to_rot6d_batch(T_abs[..., :3, :3]).astype(np.float32)
+        return np.concatenate([abs_t, abs_rot6d], axis=-1)  # (B, T, 9)
+
     def decode_action(self, model_pred: dict, states: list[dict]):
         """Wait for NPU, decode and unnormalize actions."""
         import time
         import numpy as np
+        from gr00t.data.types import ActionType
         _prof = getattr(self, '_enable_profiling', False)
 
         if _prof:
@@ -518,39 +577,33 @@ class Gr00tPolicy(BasePolicy):
             group_slice = np.clip(action_np[..., :action_horizon, s:e], -1.0, 1.0)
             denorm = (group_slice * grp["scale"] + grp["offset"]).astype(np.float32)
 
-            # Relative→absolute: add last-timestep state as reference
+            # Relative→absolute conversion
             if grp["is_relative"] and batched_states is not None:
-                state_key = grp["state_key"]
-                ref_state = batched_states[state_key][:, -1, :]  # (B, D)
-                denorm = denorm + ref_state[:, None, :].astype(np.float32)
+                ref_state = batched_states[grp["state_key"]][:, -1, :]
+                if grp["action_type"] == ActionType.EEF:
+                    denorm = self._eef_relative_to_absolute(denorm, ref_state)
+                else:
+                    denorm = denorm + ref_state[:, None, :].astype(np.float32)
 
             casted_action[key] = denorm
         if _prof:
             t_decode = time.time() - t0
 
-        # Verification
+        # Verification: compare all groups against processor
         if not hasattr(self, '_verify_step'):
             self._verify_step = 0
         self._verify_step += 1
         if self._verify_step == 1:
-            key = "joint_position"
-            grp = self._action_denorm_groups[2]
-            s, e = grp["start"], grp["end"]
-            group_slice = action_np[..., :action_horizon, s:e]
-
-            # Call processor's full pipeline for comparison
             batched_states_v = {}
             for k in self.modality_configs["state"].modality_keys:
                 batched_states_v[k] = np.stack([s_val[k] for s_val in states], axis=0)
             old_result = self.processor.decode_action(
                 action_np, self.embodiment_tag, batched_states_v
             )
-            old_jp = old_result[key].astype(np.float32)
-
-            print(f"[VERIFY] joint_position processor[0,0,:3]: {old_jp[0, 0, :3]}")
-            print(f"[VERIFY] joint_position mine[0,0,:3]:      {casted_action[key][0, 0, :3]}")
-            print(f"[VERIFY] diff: {np.abs(casted_action[key] - old_jp).max():.6f}")
-            print(f"[VERIFY] is_relative per group: {[(g.get('is_relative'), g.get('state_key')) for g in self._action_denorm_groups]}")
+            for key in self.modality_configs["action"].modality_keys:
+                old = old_result[key].astype(np.float32)
+                diff = np.abs(casted_action[key] - old).max()
+                print(f"[VERIFY] {key}: diff={diff:.6f}  mine[0,0,:3]={casted_action[key][0,0,:3]}  proc[0,0,:3]={old[0,0,:3]}")
 
         if _prof:
             if not hasattr(self, '_prof_decode_step'):
