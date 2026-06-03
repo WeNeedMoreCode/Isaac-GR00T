@@ -215,7 +215,7 @@ class Gr00tPolicy(BasePolicy):
         self.language_key = language_keys[0]
 
     def _init_action_denorm(self, device):
-        """Precompute scale/offset arrays for action denormalization."""
+        """Precompute scale/offset arrays and action config for action denormalization."""
         import numpy as np
 
         norm_params = self.processor.state_action_processor.norm_params
@@ -223,10 +223,12 @@ class Gr00tPolicy(BasePolicy):
         action_modality = self.modality_configs["action"]
         joint_groups = action_modality.modality_keys
         mean_std_keys = action_modality.mean_std_embedding_keys
+        action_configs = action_modality.action_configs
+        use_relative = self.processor.state_action_processor.use_relative_action
 
         self._action_denorm_groups = []
         start_idx = 0
-        for key in joint_groups:
+        for i, key in enumerate(joint_groups):
             params = norm_params[emb]["action"][key]
             joint_dim = params["dim"].item()
             if mean_std_keys is not None and key in mean_std_keys:
@@ -238,11 +240,22 @@ class Gr00tPolicy(BasePolicy):
                 range_v = max_v - min_v
                 scale = range_v / 2.0
                 offset = min_v + range_v / 2.0
+            # Save relative action info
+            is_relative = False
+            state_key = key
+            if action_configs is not None and use_relative:
+                acfg = action_configs[i]
+                from gr00t.data.types import ActionRepresentation
+                if acfg.rep == ActionRepresentation.RELATIVE:
+                    is_relative = True
+                    state_key = acfg.state_key if acfg.state_key else key
             self._action_denorm_groups.append({
                 "scale": scale,
                 "offset": offset,
                 "start": start_idx,
                 "end": start_idx + joint_dim,
+                "is_relative": is_relative,
+                "state_key": state_key,
             })
             start_idx += joint_dim
 
@@ -489,13 +502,29 @@ class Gr00tPolicy(BasePolicy):
         action_np = action_pred.float().cpu().numpy()
         action_horizon = len(self.modality_configs["action"].delta_indices)
 
-        # CPU denormalization with precomputed scale/offset
+        # Build batched state dict for relative→absolute conversion
+        batched_states = None
+        has_relative = any(g["is_relative"] for g in self._action_denorm_groups)
+        if has_relative:
+            batched_states = {}
+            for k in self.modality_configs["state"].modality_keys:
+                batched_states[k] = np.stack([s_val[k] for s_val in states], axis=0)
+
+        # CPU denormalization with precomputed scale/offset + relative→absolute
         casted_action = {}
         for i, key in enumerate(self.modality_configs["action"].modality_keys):
             grp = self._action_denorm_groups[i]
             s, e = grp["start"], grp["end"]
             group_slice = np.clip(action_np[..., :action_horizon, s:e], -1.0, 1.0)
-            casted_action[key] = (group_slice * grp["scale"] + grp["offset"]).astype(np.float32)
+            denorm = (group_slice * grp["scale"] + grp["offset"]).astype(np.float32)
+
+            # Relative→absolute: add last-timestep state as reference
+            if grp["is_relative"] and batched_states is not None:
+                state_key = grp["state_key"]
+                ref_state = batched_states[state_key][:, -1, :]  # (B, D)
+                denorm = denorm + ref_state[:, None, :].astype(np.float32)
+
+            casted_action[key] = denorm
         if _prof:
             t_decode = time.time() - t0
 
@@ -509,27 +538,19 @@ class Gr00tPolicy(BasePolicy):
             s, e = grp["start"], grp["end"]
             group_slice = action_np[..., :action_horizon, s:e]
 
-            # Call original function directly
-            from gr00t.data.utils import unnormalize_values_minmax
-            params = self.processor.state_action_processor.norm_params[
-                self.embodiment_tag.value]["action"][key]
-            direct = unnormalize_values_minmax(group_slice, params)
-
-            # Call processor's full pipeline
-            batched_states = {}
+            # Call processor's full pipeline for comparison
+            batched_states_v = {}
             for k in self.modality_configs["state"].modality_keys:
-                batched_states[k] = np.stack([s_val[k] for s_val in states], axis=0)
+                batched_states_v[k] = np.stack([s_val[k] for s_val in states], axis=0)
             old_result = self.processor.decode_action(
-                action_np, self.embodiment_tag, batched_states
+                action_np, self.embodiment_tag, batched_states_v
             )
             old_jp = old_result[key].astype(np.float32)
 
-            print(f"[VERIFY] raw_input[0,0,:3]: {group_slice[0, 0, :3]}")
-            print(f"[VERIFY] direct_fn[0,0,:3]: {direct[0, 0, :3]}")
-            print(f"[VERIFY] processor[0,0,:3]: {old_jp[0, 0, :3]}")
-            print(f"[VERIFY] mine[0,0,:3]:      {casted_action[key][0, 0, :3]}")
-            print(f"[VERIFY] diff_direct_vs_proc: {np.abs(direct - old_jp).max():.6f}")
-            print(f"[VERIFY] diff_direct_vs_mine: {np.abs(direct.astype(np.float32) - casted_action[key]).max():.6f}")
+            print(f"[VERIFY] joint_position processor[0,0,:3]: {old_jp[0, 0, :3]}")
+            print(f"[VERIFY] joint_position mine[0,0,:3]:      {casted_action[key][0, 0, :3]}")
+            print(f"[VERIFY] diff: {np.abs(casted_action[key] - old_jp).max():.6f}")
+            print(f"[VERIFY] is_relative per group: {[(g.get('is_relative'), g.get('state_key')) for g in self._action_denorm_groups]}")
 
         if _prof:
             if not hasattr(self, '_prof_decode_step'):
