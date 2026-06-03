@@ -589,22 +589,6 @@ class Gr00tPolicy(BasePolicy):
         if _prof:
             t_decode = time.time() - t0
 
-        # Verification: compare all groups against processor
-        if not hasattr(self, '_verify_step'):
-            self._verify_step = 0
-        self._verify_step += 1
-        if self._verify_step == 1:
-            batched_states_v = {}
-            for k in self.modality_configs["state"].modality_keys:
-                batched_states_v[k] = np.stack([s_val[k] for s_val in states], axis=0)
-            old_result = self.processor.decode_action(
-                action_np, self.embodiment_tag, batched_states_v
-            )
-            for key in self.modality_configs["action"].modality_keys:
-                old = old_result[key].astype(np.float32)
-                diff = np.abs(casted_action[key] - old).max()
-                print(f"[VERIFY] {key}: diff={diff:.6f}  mine[0,0,:3]={casted_action[key][0,0,:3]}  proc[0,0,:3]={old[0,0,:3]}")
-
         if _prof:
             if not hasattr(self, '_prof_decode_step'):
                 self._prof_decode_step = 0

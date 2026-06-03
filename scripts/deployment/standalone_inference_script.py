@@ -703,7 +703,8 @@ def main(args: ArgsConfig):
         policy.model._enable_profiling = True
         policy.model.backbone._enable_profiling = True
         policy._enable_profiling = True
-        logging.info("Profiling enabled")
+        policy.model._profile_sync = True  # sync NPU for accurate timing
+        logging.info("Profiling enabled (with NPU sync for accurate timing)")
 
     # Apply inference mode
     if args.inference_mode == "trt_full_pipeline":

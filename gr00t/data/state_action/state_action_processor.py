@@ -452,19 +452,12 @@ class StateActionProcessor:
 
             unnormalized_values[joint_group] = unnormalized
 
-        # [VERIFY] Step 1 done — print denormalized values before relative conversion
-        if joint_group == "joint_position" and not hasattr(self, '_verify_unapply'):
-            self._verify_unapply = True
-            print(f"[VERIFY unapply] step1 denorm joint_position[0,0,:3]: {unnormalized_values['joint_position'][0,0,:3]}")
-
         # Step 2: Convert relative actions to absolute (if needed)
         action_configs = self.modality_configs[embodiment_tag]["action"].action_configs
 
         if action_configs is not None:
             for key, action_config in zip(modality_keys, action_configs):
                 if action_config.rep == ActionRepresentation.RELATIVE and self.use_relative_action:
-                    if key == "joint_position":
-                        print(f"[VERIFY unapply] ENTERING relative->absolute for joint_position")
                     if state is None:
                         raise ValueError(
                             f"State dict required for relative->absolute conversion of key '{key}' "
