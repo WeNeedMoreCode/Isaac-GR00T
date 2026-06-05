@@ -139,7 +139,7 @@ class Qwen3Backbone(torch.nn.Module):
         import torch.nn as nn
 
         num_splits = 4
-        for layer in self.model.language_model.layers:
+        for layer_idx, layer in enumerate(self.model.language_model.layers):
             mlp = layer.mlp
             gate_w = mlp.gate_proj.weight  # [6144, 2048]
             up_w = mlp.up_proj.weight      # [6144, 2048]
@@ -182,29 +182,50 @@ class Qwen3Backbone(torch.nn.Module):
             gate_linears = gate_linears.to(gate_w.device, gate_w.dtype)
             up_linears = up_linears.to(up_w.device, up_w.dtype)
 
-            # Replace mlp.forward with split version
+            # Replace mlp.forward with dual-path version (original + split4, compare)
             act_fn = mlp.act_fn
+            orig_gate = mlp.gate_proj
+            orig_up = mlp.up_proj
+            orig_down = mlp.down_proj
+            _verify = getattr(self, '_ffn_split4_verify', True)
 
-            def _make_split_forward(g_lins, u_lins, act, down):
+            def _make_split_forward(g_lins, u_lins, act, o_gate, o_up, o_down, verify, lidx):
                 def _forward(self_mlp, x):
+                    # Split path
                     chunks = []
                     for g, u in zip(g_lins, u_lins):
                         chunks.append(act(g(x)) * u(x))
-                    return down(torch.cat(chunks, dim=-1))
+                    split_out = o_down(torch.cat(chunks, dim=-1))
+
+                    # Dual-path comparison on first 2 calls
+                    if verify and _forward._call_count < 2:
+                        _forward._call_count += 1
+                        with torch.no_grad():
+                            orig_out = o_down(act(o_gate(x)) * o_up(x))
+                            diff = (orig_out - split_out).abs().max().item()
+                            if diff > 1e-3:
+                                print(f"[SPLIT4-VERIFY] layer {lidx} call {_forward._call_count}: "
+                                      f"FAIL max_diff={diff:.6f}")
+                            else:
+                                print(f"[SPLIT4-VERIFY] layer {lidx} call {_forward._call_count}: "
+                                      f"OK max_diff={diff:.8f}")
+                    return split_out
+                _forward._call_count = 0
                 return _forward
 
             mlp.gate_linears = gate_linears
             mlp.up_linears = up_linears
             mlp.forward = _make_split_forward(
-                gate_linears, up_linears, act_fn, mlp.down_proj
+                gate_linears, up_linears, act_fn, orig_gate, orig_up, orig_down,
+                _verify, layer_idx
             ).__get__(mlp, type(mlp))
 
-            # Free original large weights
-            del mlp.gate_proj
-            del mlp.up_proj
+            # Keep original gate_proj/up_proj for dual-path verification
+            # del mlp.gate_proj
+            # del mlp.up_proj
 
         logger.info(
-            f"Applied FFN split4: {out_features}→{chunk_size} x{num_splits} "
+            f"Applied FFN split4 (dual-path verify): {out_features}→{chunk_size} x{num_splits} "
             f"across {len(self.model.language_model.layers)} layers"
         )
 
