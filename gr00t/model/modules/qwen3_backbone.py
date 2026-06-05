@@ -79,6 +79,7 @@ class Qwen3Backbone(torch.nn.Module):
             self.model.language_model.layers.pop(-1)
 
         self.select_layer = select_layer
+        self._apply_ffn_split4()
         self.set_trainable_parameters(tune_llm, tune_visual, tune_top_llm_layers)
         if load_bf16 and trainable_params_fp32:
             # cast trainable parameters to fp32
@@ -127,6 +128,85 @@ class Qwen3Backbone(torch.nn.Module):
 
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
+
+    def _apply_ffn_split4(self):
+        """Split large FFN MatMul (2048→6144) into 4 smaller ones (2048→1536).
+
+        Improves NPU cube utilization. Mathematically equivalent to the original:
+          original: down_proj(silu(gate_proj(x)) * up_proj(x))
+          split4:   down_proj(cat([silu(g_i(x)) * u_i(x) for i in range(4)]))
+        """
+        import torch.nn as nn
+
+        num_splits = 4
+        for layer in self.model.language_model.layers:
+            mlp = layer.mlp
+            gate_w = mlp.gate_proj.weight  # [6144, 2048]
+            up_w = mlp.up_proj.weight      # [6144, 2048]
+            gate_b = mlp.gate_proj.bias
+            up_b = mlp.up_proj.bias
+
+            in_features = gate_w.shape[1]
+            out_features = gate_w.shape[0]
+            chunk_size = out_features // num_splits
+
+            if out_features % num_splits != 0:
+                logger.warning(
+                    f"FFN intermediate_size={out_features} not divisible by {num_splits}, skip split4"
+                )
+                return
+
+            # Split weights into chunks
+            gate_chunks = gate_w.chunk(num_splits, dim=0)
+            up_chunks = up_w.chunk(num_splits, dim=0)
+            gate_bias_chunks = gate_b.chunk(num_splits, dim=0) if gate_b is not None else [None] * num_splits
+            up_bias_chunks = up_b.chunk(num_splits, dim=0) if up_b is not None else [None] * num_splits
+
+            # Create split Linear layers
+            gate_linears = nn.ModuleList()
+            up_linears = nn.ModuleList()
+            for i in range(num_splits):
+                g = nn.Linear(in_features, chunk_size, bias=gate_bias_chunks[i] is not None)
+                g.weight = nn.Parameter(gate_chunks[i].clone())
+                if gate_bias_chunks[i] is not None:
+                    g.bias = nn.Parameter(gate_bias_chunks[i].clone())
+                gate_linears.append(g)
+
+                u = nn.Linear(in_features, chunk_size, bias=up_bias_chunks[i] is not None)
+                u.weight = nn.Parameter(up_chunks[i].clone())
+                if up_bias_chunks[i] is not None:
+                    u.bias = nn.Parameter(up_bias_chunks[i].clone())
+                up_linears.append(u)
+
+            # Move to same device/dtype as original
+            gate_linears = gate_linears.to(gate_w.device, gate_w.dtype)
+            up_linears = up_linears.to(up_w.device, up_w.dtype)
+
+            # Replace mlp.forward with split version
+            act_fn = mlp.act_fn
+
+            def _make_split_forward(g_lins, u_lins, act, down):
+                def _forward(self_mlp, x):
+                    chunks = []
+                    for g, u in zip(g_lins, u_lins):
+                        chunks.append(act(g(x)) * u(x))
+                    return down(torch.cat(chunks, dim=-1))
+                return _forward
+
+            mlp.gate_linears = gate_linears
+            mlp.up_linears = up_linears
+            mlp.forward = _make_split_forward(
+                gate_linears, up_linears, act_fn, mlp.down_proj
+            ).__get__(mlp, type(mlp))
+
+            # Free original large weights
+            del mlp.gate_proj
+            del mlp.up_proj
+
+        logger.info(
+            f"Applied FFN split4: {out_features}→{chunk_size} x{num_splits} "
+            f"across {len(self.model.language_model.layers)} layers"
+        )
 
     def _ensure_visual_cache(self):
         """Lazily pre-compute and cache visual encoder static values.
@@ -356,9 +436,7 @@ class Qwen3Backbone(torch.nn.Module):
                 idx = visual_indices.unsqueeze(0).unsqueeze(-1).expand(
                     -1, -1, hidden_states.shape[-1]
                 )
-                current = torch.gather(hidden_states, 1, idx)
-                updated = current + visual_embed.unsqueeze(0)
-                hidden_states = hidden_states.scatter(1, idx, updated)
+                hidden_states = hidden_states.scatter_add(1, idx, visual_embed.unsqueeze(0))
 
         # Return pre-norm hidden states (no final norm)
         return hidden_states
