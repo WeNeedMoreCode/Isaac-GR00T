@@ -197,18 +197,30 @@ class Qwen3Backbone(torch.nn.Module):
                         chunks.append(act(g(x)) * u(x))
                     split_out = o_down(torch.cat(chunks, dim=-1))
 
-                    # Dual-path comparison on first 2 calls
-                    if verify and _forward._call_count < 2:
+                    # Dual-path comparison on first call only
+                    if verify and _forward._call_count < 1:
                         _forward._call_count += 1
                         with torch.no_grad():
-                            orig_out = o_down(act(o_gate(x)) * o_up(x))
-                            diff = (orig_out - split_out).abs().max().item()
-                            if diff > 1e-3:
-                                print(f"[SPLIT4-VERIFY] layer {lidx} call {_forward._call_count}: "
-                                      f"FAIL max_diff={diff:.6f}")
-                            else:
-                                print(f"[SPLIT4-VERIFY] layer {lidx} call {_forward._call_count}: "
-                                      f"OK max_diff={diff:.8f}")
+                            # Original path
+                            orig_gate_out = o_gate(x)
+                            orig_up_out = o_up(x)
+                            orig_act_gate = act(orig_gate_out)
+                            orig_mul = orig_act_gate * orig_up_out
+                            orig_out = o_down(orig_mul)
+
+                            # Split path intermediate
+                            split_gate_outs = [g(x) for g in g_lins]
+                            split_up_outs = [u(x) for u in u_lins]
+                            split_gate_cat = torch.cat(split_gate_outs, dim=-1)
+
+                            # Sub-operation diffs
+                            gate_diff = (orig_gate_out - split_gate_cat).abs().max().item()
+                            up_diff = sum((orig_up_out[:, :, i*chunk_size:(i+1)*chunk_size] - split_up_outs[i]).abs().max().item() for i in range(num_splits))
+                            print(f"[SPLIT4-VERIFY] layer {lidx}: "
+                                  f"gate_diff={gate_diff:.6f} up_diff={up_diff:.6f} "
+                                  f"final_diff={(orig_out - split_out).abs().max().item():.6f} "
+                                  f"x_range=[{x.min().item():.2f},{x.max().item():.2f}] "
+                                  f"gate_range=[{orig_gate_out.min().item():.2f},{orig_gate_out.max().item():.2f}]")
                     return split_out
                 _forward._call_count = 0
                 return _forward
