@@ -201,26 +201,26 @@ class Qwen3Backbone(torch.nn.Module):
                     if verify and _forward._call_count < 1:
                         _forward._call_count += 1
                         with torch.no_grad():
-                            # Original path
+                            # Level 1: Weight comparison
+                            split_w_cat = torch.cat([g.weight for g in g_lins], dim=0)
+                            w_diff = (o_gate.weight - split_w_cat).abs().max().item()
+
+                            # Level 2: Raw matmul (bypass nn.Linear)
+                            raw_orig = x @ o_gate.weight.T  # [*, 6144]
+                            raw_split = torch.cat([x @ g.weight.T for g in g_lins], dim=-1)
+                            matmul_diff = (raw_orig - raw_split).abs().max().item()
+
+                            # Level 3: nn.Linear output
                             orig_gate_out = o_gate(x)
-                            orig_up_out = o_up(x)
-                            orig_act_gate = act(orig_gate_out)
-                            orig_mul = orig_act_gate * orig_up_out
-                            orig_out = o_down(orig_mul)
-
-                            # Split path intermediate
                             split_gate_outs = [g(x) for g in g_lins]
-                            split_up_outs = [u(x) for u in u_lins]
                             split_gate_cat = torch.cat(split_gate_outs, dim=-1)
+                            linear_diff = (orig_gate_out - split_gate_cat).abs().max().item()
 
-                            # Sub-operation diffs
-                            gate_diff = (orig_gate_out - split_gate_cat).abs().max().item()
-                            up_diff = sum((orig_up_out[:, :, i*chunk_size:(i+1)*chunk_size] - split_up_outs[i]).abs().max().item() for i in range(num_splits))
-                            print(f"[SPLIT4-VERIFY] layer {lidx}: "
-                                  f"gate_diff={gate_diff:.6f} up_diff={up_diff:.6f} "
-                                  f"final_diff={(orig_out - split_out).abs().max().item():.6f} "
-                                  f"x_range=[{x.min().item():.2f},{x.max().item():.2f}] "
-                                  f"gate_range=[{orig_gate_out.min().item():.2f},{orig_gate_out.max().item():.2f}]")
+                            print(f"[SPLIT4] L{lidx}: "
+                                  f"w_diff={w_diff:.6f} "
+                                  f"matmul_diff={matmul_diff:.6f} "
+                                  f"linear_diff={linear_diff:.6f} "
+                                  f"final_diff={(o_down(act(orig_gate_out) * o_up(x)) - split_out).abs().max().item():.6f}")
                     return split_out
                 _forward._call_count = 0
                 return _forward
