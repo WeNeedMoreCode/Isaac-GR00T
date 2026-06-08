@@ -79,7 +79,7 @@ class Qwen3Backbone(torch.nn.Module):
             self.model.language_model.layers.pop(-1)
 
         self.select_layer = select_layer
-        self._apply_ffn_split4()
+        self._ffn_split4_done = False
         self.set_trainable_parameters(tune_llm, tune_visual, tune_top_llm_layers)
         if load_bf16 and trainable_params_fp32:
             # cast trainable parameters to fp32
@@ -245,11 +245,15 @@ class Qwen3Backbone(torch.nn.Module):
         """Lazily pre-compute and cache visual encoder static values.
 
         Called once on first inference when model is already on the target device.
-        Bypasses torch.linspace / .tolist() / .item() that block torchair compilation.
-        Also monkey-patches visual attention to use reshape instead of dynamic split.
+        Also applies FFN split4 after model is on NPU (avoids weight format divergence).
         """
         if self._visual_cache_initialized:
             return
+
+        # Apply FFN split4 AFTER model is on NPU (weights already format-converted)
+        if not self._ffn_split4_done:
+            self._apply_ffn_split4()
+            self._ffn_split4_done = True
 
         visual = self.model.model.visual
         # Fixed grid_thw for the dataset: 4 images, each 16x16
