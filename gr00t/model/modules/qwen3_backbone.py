@@ -187,54 +187,24 @@ class Qwen3Backbone(torch.nn.Module):
             orig_gate = mlp.gate_proj
             orig_up = mlp.up_proj
             orig_down = mlp.down_proj
-            _verify = getattr(self, '_ffn_split4_verify', True)
 
-            def _make_split_forward(g_lins, u_lins, act, o_gate, o_up, o_down, verify, lidx):
+            def _make_split_forward(g_lins, u_lins, act, down):
                 def _forward(self_mlp, x):
-                    # Split path
                     chunks = []
                     for g, u in zip(g_lins, u_lins):
                         chunks.append(act(g(x)) * u(x))
-                    split_out = o_down(torch.cat(chunks, dim=-1))
-
-                    # Dual-path comparison on first call only
-                    if verify and _forward._call_count < 1:
-                        _forward._call_count += 1
-                        with torch.no_grad():
-                            # Level 1: Weight comparison
-                            split_w_cat = torch.cat([g.weight for g in g_lins], dim=0)
-                            w_diff = (o_gate.weight - split_w_cat).abs().max().item()
-
-                            # Level 2: Raw matmul (bypass nn.Linear)
-                            raw_orig = x @ o_gate.weight.T  # [*, 6144]
-                            raw_split = torch.cat([x @ g.weight.T for g in g_lins], dim=-1)
-                            matmul_diff = (raw_orig - raw_split).abs().max().item()
-
-                            # Level 3: nn.Linear output
-                            orig_gate_out = o_gate(x)
-                            split_gate_outs = [g(x) for g in g_lins]
-                            split_gate_cat = torch.cat(split_gate_outs, dim=-1)
-                            linear_diff = (orig_gate_out - split_gate_cat).abs().max().item()
-
-                            print(f"[SPLIT4] L{lidx}: "
-                                  f"w_diff={w_diff:.6f} "
-                                  f"matmul_diff={matmul_diff:.6f} "
-                                  f"linear_diff={linear_diff:.6f} "
-                                  f"final_diff={(o_down(act(orig_gate_out) * o_up(x)) - split_out).abs().max().item():.6f}")
-                    return split_out
-                _forward._call_count = 0
+                    return down(torch.cat(chunks, dim=-1))
                 return _forward
 
             mlp.gate_linears = gate_linears
             mlp.up_linears = up_linears
             mlp.forward = _make_split_forward(
-                gate_linears, up_linears, act_fn, orig_gate, orig_up, orig_down,
-                _verify, layer_idx
+                gate_linears, up_linears, act_fn, orig_down
             ).__get__(mlp, type(mlp))
 
-            # Keep original gate_proj/up_proj for dual-path verification
-            # del mlp.gate_proj
-            # del mlp.up_proj
+            # Free original large weights
+            del mlp.gate_proj
+            del mlp.up_proj
 
         logger.info(
             f"Applied FFN split4 (dual-path verify): {out_features}→{chunk_size} x{num_splits} "
