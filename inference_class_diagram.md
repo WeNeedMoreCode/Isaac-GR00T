@@ -286,12 +286,12 @@ sequenceDiagram
 
     Script->>Script: prepare_observation_data() [CPU async预取]
 
-    Script->>Policy: get_action(obs)
+    Script->>Policy: get_action(obs) [端到端: 预处理+推理+后处理]
     Note over Policy: Step 1: prepare_inputs()
     Policy->>Policy: processor(messages) → collate_fn() → cast fp16
 
     Note over Policy: Step 2: dispatch_inference()
-    Policy->>Model: get_action(**inputs)
+    Policy->>Model: Gr00tN1d7.get_action(**inputs) [仅NPU推理]
     Model->>Model: prepare_input() [拆分BB/AH输入, to(device)]
 
     Model->>BB: forward(backbone_inputs) ~170ms
@@ -300,7 +300,7 @@ sequenceDiagram
     BB->>BB: _language_model_forward() [16层LLM]
     BB-->>Model: backbone_features
 
-    Model->>AH: get_action(backbone_features, action_inputs) ~37ms
+    Model->>AH: ActionHead.get_action(backbone_features, action_inputs) ~37ms
     AH-->>Model: action_pred (normalized)
     Model-->>Policy: model_pred
 
