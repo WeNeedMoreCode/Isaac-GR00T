@@ -41,13 +41,7 @@ dependencies = [
     "pyzmq==27.0.1",
     # deepspeed has no aarch64 Linux wheel
     "deepspeed==0.17.6; platform_machine != 'aarch64' or sys_platform != 'linux'",
-    # triton is needed on aarch64 (GB200) but ships with torch on x86_64
-    "triton==3.3.1; sys_platform == 'linux' and platform_machine == 'aarch64'",
-    "flash-attn==2.7.4.post1",
     "onnx>=1.20.0",
-    # cu12 wheels only exist for x86_64; Blackwell / aarch64 requires cu13.
-    "tensorrt-cu12>=10.15.1.29; platform_machine == 'x86_64'",
-    "tensorrt-cu13>=10.15.1.29; platform_machine == 'aarch64'",
 ]
 
 [project.optional-dependencies]
