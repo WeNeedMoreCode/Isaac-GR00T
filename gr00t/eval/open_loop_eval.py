@@ -273,10 +273,13 @@ class ArgsConfig:
     model_path: str | None = None
     """Path to the model checkpoint."""
 
+    backbone_path: str | None = None
+    """Path to the backbone model (e.g. local Cosmos-Reason2-2B)."""
+
     denoising_steps: int = 4
     """Number of denoising steps to use."""
 
-    device: str = "cuda"
+    device: str = "npu:0"
     """Device to run inference on (cuda or npu)."""
 
     save_plot_path: str | None = None
@@ -316,6 +319,7 @@ def main(args: ArgsConfig):
         policy = Gr00tPolicy(
             embodiment_tag=args.embodiment_tag,
             model_path=local_model_path,
+            backbone_path=args.backbone_path,
             device=args.device,
         )
     else:
