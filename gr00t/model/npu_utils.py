@@ -101,6 +101,39 @@ def patch_tensor_type_for_npu():
     logger.info("Patched torch.Tensor.type for NPU")
 
 
+def _is_rc_device():
+    """Check if the current device is an Ascend rc device via lspci."""
+    try:
+        import subprocess
+        out = subprocess.run(["lspci"], capture_output=True, text=True, timeout=5)
+        pci_info = [line for line in out.stdout.split("\n") if "accelerators" in line.strip()]
+        return not pci_info
+    except Exception:
+        return False
+
+
+def patch_floordiv_for_rc():
+    """Monkey-patch torch.Tensor.__floordiv__ for rc device compatibility.
+
+    Ascend rc device's native floor division can produce incorrect results due to
+    fp16 precision loss. This patch performs true division first, then casts back
+    to the original dtype to preserve numerical correctness.
+    """
+    if not _is_rc_device():
+        return
+
+    def _patched_floordiv(self, other):
+        tmp = self / other
+        if isinstance(tmp, torch.Tensor):
+            result = tmp.type(self.dtype)
+        else:
+            result = tmp.__floordiv__(other) if hasattr(tmp, "__floordiv__") else (self // other)
+        return result
+
+    torch.Tensor.__floordiv__ = _patched_floordiv
+    logger.info("Patched torch.Tensor.__floordiv__ for rc device")
+
+
 # ---------------------------------------------------------------------------
 # FRACTAL_NZ weight casting
 # ---------------------------------------------------------------------------

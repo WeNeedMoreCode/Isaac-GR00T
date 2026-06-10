@@ -104,10 +104,11 @@ class Gr00tPolicy(BasePolicy):
         # NPU adaptation: patch RoPE before loading backbone
         is_npu = str(device).startswith("npu")
         if is_npu:
-            from gr00t.model.npu_utils import patch_qwen3_rope_for_npu, patch_tensor_type_for_npu
+            from gr00t.model.npu_utils import patch_qwen3_rope_for_npu, patch_tensor_type_for_npu, patch_floordiv_for_rc
 
             patch_qwen3_rope_for_npu()
             patch_tensor_type_for_npu()
+            patch_floordiv_for_rc()
 
         # Load the pretrained model and move to target device with float16 precision
         if backbone_path:

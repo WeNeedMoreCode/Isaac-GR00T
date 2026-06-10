@@ -474,7 +474,8 @@ class Gr00tN1d7ActionHead(nn.Module):
 
 
 def get_backbone_cls(config: Gr00tN1d7Config):
-    if "nvidia/Cosmos-Reason2" in config.model_name or "Qwen/Qwen3-VL" in config.model_name:
+    model_name = config.model_name or ""
+    if "Cosmos-Reason2" in model_name or "Qwen/Qwen3-VL" in model_name:
         # We import here as Qwen3Backbone depends on newer transformers versions than the rest of the code.
         from gr00t.model.modules.qwen3_backbone import Qwen3Backbone
 
