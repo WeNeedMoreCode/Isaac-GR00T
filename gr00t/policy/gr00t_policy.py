@@ -23,10 +23,12 @@ This module provides the core policy classes for running Gr00t models:
 from pathlib import Path
 from typing import Any
 
-# NPU torchair compilation toggle: 0=disable, 1=compile LM+action_head, 2=compile all (visual+LM+action_head)
-syx_compile = 2
-
 import numpy as np
+
+# NPU compilation flags: control which stages are compiled by torchair
+_COMPILE_VISUAL_ENCODER = True
+_COMPILE_LANGUAGE_MODEL = True
+_COMPILE_ACTION_HEAD = True
 import torch
 from transformers import AutoModel, AutoProcessor
 
@@ -104,7 +106,7 @@ class Gr00tPolicy(BasePolicy):
         # NPU adaptation: patch RoPE before loading backbone
         is_npu = str(device).startswith("npu")
         if is_npu:
-            from gr00t.model.npu_utils import patch_qwen3_rope_for_npu, patch_tensor_type_for_npu, patch_floordiv_for_rc
+            from npu_utils import patch_qwen3_rope_for_npu, patch_tensor_type_for_npu, patch_floordiv_for_rc
 
             patch_qwen3_rope_for_npu()
             patch_tensor_type_for_npu()
@@ -122,8 +124,8 @@ class Gr00tPolicy(BasePolicy):
         if is_npu:
             model = model.to(device=device, dtype=torch.float16)
             # Conv3D lacks a precompiled kernel under jit_compile=False.
-            # Needed when patch_embed runs in eager mode (not compiled by torchair).
-            if syx_compile < 2:
+            # Only needed when visual encoder runs in eager mode (not compiled by torchair).
+            if not _COMPILE_VISUAL_ENCODER:
                 try:
                     patch_embed = model.backbone.model.model.visual.patch_embed
                     _orig_forward = patch_embed.forward
@@ -146,14 +148,16 @@ class Gr00tPolicy(BasePolicy):
             model.to(device=device, dtype=torch.float16)
 
         # NPU adaptation: FRACTAL_NZ + torchair compile
-        if is_npu and syx_compile:
-            from gr00t.model.npu_utils import compile_for_npu, format_cast_to_nz
+        if is_npu:
+            from npu_utils import compile_for_npu, format_cast_to_nz
 
             format_cast_to_nz(model)
-            if syx_compile >= 2:
+            if _COMPILE_VISUAL_ENCODER:
                 compile_for_npu(model.backbone, "_preprocess_vl_input")
-            compile_for_npu(model.backbone, "_language_model_forward")
-            compile_for_npu(model.action_head.model, "forward")
+            if _COMPILE_LANGUAGE_MODEL:
+                compile_for_npu(model.backbone, "_language_model_forward")
+            if _COMPILE_ACTION_HEAD:
+                compile_for_npu(model.action_head.model, "forward")
 
         self.model = model
 
