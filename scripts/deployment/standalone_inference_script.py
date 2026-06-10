@@ -639,6 +639,9 @@ class ArgsConfig:
     device: str = "cuda"
     """Device to run inference on (cuda, npu, or cpu)."""
 
+    backbone_path: str | None = None
+    """Local path to backbone model (e.g. ./checkpoints/Cosmos-Reason2-2B). Overrides config.model_name."""
+
 
 def main(args: ArgsConfig):
     # NPU initialization
@@ -698,6 +701,7 @@ def main(args: ArgsConfig):
         embodiment_tag=args.embodiment_tag,
         model_path=local_model_path,
         device=args.device,
+        backbone_path=args.backbone_path,
     )
 
     # Override denoising steps if specified

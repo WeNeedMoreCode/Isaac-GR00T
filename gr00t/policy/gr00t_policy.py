@@ -81,6 +81,7 @@ class Gr00tPolicy(BasePolicy):
         *,
         device: int | str,
         strict: bool = True,
+        backbone_path: str | None = None,
     ):
         """Initialize the Gr00t Policy.
 
@@ -90,6 +91,7 @@ class Gr00tPolicy(BasePolicy):
             model_path: Path to the pretrained model checkpoint directory
             device: Device to run the model on (e.g., 'cuda:0', 0, 'cpu')
             strict: Whether to enforce strict input validation (default: True)
+            backbone_path: Local path to backbone model. Overrides config.model_name.
         """
         # Import this to register all models.
         import gr00t.model  # noqa: F401
@@ -108,7 +110,13 @@ class Gr00tPolicy(BasePolicy):
             patch_tensor_type_for_npu()
 
         # Load the pretrained model and move to target device with float16 precision
-        model = AutoModel.from_pretrained(model_dir)
+        if backbone_path:
+            from transformers import AutoConfig
+            _cfg = AutoConfig.from_pretrained(model_dir)
+            _cfg.model_name = backbone_path
+            model = AutoModel.from_pretrained(model_dir, config=_cfg)
+        else:
+            model = AutoModel.from_pretrained(model_dir)
         model.eval()  # Set model to evaluation mode
         if is_npu:
             model = model.to(device=device, dtype=torch.float16)
