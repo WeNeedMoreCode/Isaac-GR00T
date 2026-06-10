@@ -29,20 +29,28 @@ mkdir -p "$LOCAL_DIR"
 cd "$LOCAL_DIR"
 
 echo "=== 获取文件列表 ==="
-FILES=$(python3 -c "
-from huggingface_hub import list_repo_files
-for f in list_repo_files('$REPO_ID', token='$TOKEN' if '$TOKEN' else None):
-    print(f)
-")
 
-for f in $FILES; do
-    if [ -f "$f" ] && [ "$(wc -c < "$f")" -gt 0 ]; then
-        echo "[跳过] $f (已存在)"
+python3 -c "
+from huggingface_hub import list_repo_files
+import os, subprocess, sys
+
+repo = '$REPO_ID'
+token = '$TOKEN' if '$TOKEN' else None
+base = 'https://huggingface.co/' + repo + '/resolve/main'
+
+auth = ['--header', 'Authorization: Bearer ' + token] if token else []
+
+for f in list_repo_files(repo, token=token):
+    if os.path.isfile(f) and os.path.getsize(f) > 0:
+        print(f'[跳过] {f} (已存在)')
         continue
-    fi
-    echo "[下载] $f"
-    wget -c --no-check-certificate "${AUTH[@]}" "$BASE_URL/$f"
-done
+    print(f'[下载] {f}')
+    url = base + '/' + f
+    r = subprocess.run(['wget', '-c'] + auth + [url])
+    if r.returncode != 0:
+        print(f'[警告] {f} 下载失败，可重新运行脚本续传')
+print('=== 完成 ===')
+"
 
 echo "=== 完成 ==="
 ls -lh
