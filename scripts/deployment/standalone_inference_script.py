@@ -381,7 +381,6 @@ def run_single_trajectory(
     steps=300,
     action_horizon=16,
     skip_timing_steps=1,
-    npu_prof=None,
 ):
     """
     Run inference on a single trajectory.
@@ -477,10 +476,6 @@ def run_single_trajectory(
         # Prepare for next iteration
         if step_idx + 1 < len(step_counts):
             collated_inputs, states = collated_next, states_next
-
-        # Notify NPU profiler of step boundary
-        if npu_prof is not None:
-            npu_prof.step()
 
         # Action processing
         action_chunk = parse_action_gr00t(_action_chunk)
@@ -618,12 +613,6 @@ class ArgsConfig:
     denoising_steps: int = 4
     """Number of denoising steps to use."""
 
-    profile: bool = False
-    """Enable per-step profiling output (backbone/action_head timing breakdown)."""
-
-    npu_profiler: str | None = None
-    """Output directory for torch_npu.profiler data. Set to a path to enable NPU-level profiling."""
-
     save_plot_path: str | None = None
     """Path to save the plot to."""
 
@@ -710,14 +699,6 @@ def main(args: ArgsConfig):
         logging.info(f"Denoising steps overridden to: {args.denoising_steps}")
     logging.info(f"Actual num_inference_timesteps: {policy.model.action_head.num_inference_timesteps}")
 
-    # Enable profiling on model classes if requested
-    if args.profile:
-        policy.model._enable_profiling = True
-        policy.model.backbone._enable_profiling = True
-        policy._enable_profiling = True
-        policy.model._profile_sync = True  # sync NPU for accurate timing
-        logging.info("Profiling enabled (with NPU sync for accurate timing)")
-
     # Apply inference mode
     if args.inference_mode == "trt_full_pipeline":
         logging.info(f"Loading full-pipeline TRT engines from: {args.trt_engine_path}")
@@ -774,33 +755,6 @@ def main(args: ArgsConfig):
     pred_actions = []
     obs = None
 
-    # NPU profiler wrapper
-    npu_prof_ctx = None
-    if args.npu_profiler and args.device.startswith("npu"):
-        import torch_npu.profiler
-
-        npu_prof_ctx = torch_npu.profiler.profile(
-            activities=[
-                torch_npu.profiler.ProfilerActivity.CPU,
-                torch_npu.profiler.ProfilerActivity.NPU,
-            ],
-            schedule=torch_npu.profiler.schedule(
-                wait=2, warmup=1, active=2, repeat=1,
-            ),
-            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
-                dir_name=args.npu_profiler,
-                analyse_flag=True,
-            ),
-            record_shapes=True,
-            with_stack=True,
-            experimental_config=torch_npu.profiler._ExperimentalConfig(
-                profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
-                data_simplification=True,
-            ),
-        )
-        npu_prof_ctx.__enter__()
-        logging.info(f"NPU profiler enabled, output: {args.npu_profiler}")
-
     for traj_id in args.traj_ids:
         if traj_id < 0 or traj_id >= len(dataset):
             logging.warning(
@@ -825,7 +779,6 @@ def main(args: ArgsConfig):
             steps=args.steps,
             action_horizon=args.action_horizon,
             skip_timing_steps=args.skip_timing_steps,
-            npu_prof=npu_prof_ctx,
         )
         pred_actions.append(pred_action_across_time)
 
@@ -914,11 +867,6 @@ def main(args: ArgsConfig):
         raise ValueError(
             f"No valid trajectories to process. Requested IDs {args.traj_ids} are all out of range (dataset has {len(dataset)} trajectories, valid IDs: 0-{len(dataset) - 1})."
         )
-
-    # Close NPU profiler
-    if npu_prof_ctx is not None:
-        npu_prof_ctx.__exit__(None, None, None)
-        logging.info(f"NPU profiler data saved to: {args.npu_profiler}")
 
     logging.info("=" * 80)
     logging.info("Done")
