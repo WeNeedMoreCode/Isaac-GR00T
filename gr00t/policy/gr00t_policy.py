@@ -84,6 +84,7 @@ class Gr00tPolicy(BasePolicy):
         device: int | str,
         strict: bool = True,
         backbone_path: str | None = None,
+        compile: bool = True,
     ):
         """Initialize the Gr00t Policy.
 
@@ -152,11 +153,11 @@ class Gr00tPolicy(BasePolicy):
             from npu_utils import compile_for_npu, format_cast_to_nz
 
             format_cast_to_nz(model)
-            if _COMPILE_VISUAL_ENCODER:
+            if compile and _COMPILE_VISUAL_ENCODER:
                 compile_for_npu(model.backbone, "_preprocess_vl_input")
-            if _COMPILE_LANGUAGE_MODEL:
+            if compile and _COMPILE_LANGUAGE_MODEL:
                 compile_for_npu(model.backbone, "_language_model_forward")
-            if _COMPILE_ACTION_HEAD:
+            if compile and _COMPILE_ACTION_HEAD:
                 compile_for_npu(model.action_head.model, "forward")
 
         self.model = model

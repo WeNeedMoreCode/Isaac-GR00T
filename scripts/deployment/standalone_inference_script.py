@@ -639,6 +639,9 @@ class ArgsConfig:
     no_pipeline: bool = False
     """Disable CPU/NPU pipeline overlap (useful for debugging memory on shared-memory devices)."""
 
+    no_compile: bool = False
+    """Disable torchair compilation for all stages (visual encoder, language model, action head)."""
+
     get_performance_stats: bool = True
     """Agreegate and summarize timing and accuracy stats across several runs"""
 
@@ -711,6 +714,7 @@ def main(args: ArgsConfig):
         model_path=local_model_path,
         device=args.device,
         backbone_path=args.backbone_path,
+        compile=not args.no_compile,
     )
 
     # Override denoising steps if specified
