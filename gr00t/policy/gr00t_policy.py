@@ -113,6 +113,9 @@ class Gr00tPolicy(BasePolicy):
             patch_tensor_type_for_npu()
             patch_floordiv_for_rc()
 
+        # Prevent transformers from reaching HuggingFace Hub during local loading
+        os.environ["HF_HUB_OFFLINE"] = "1"
+
         # Load the pretrained model and move to target device with float16 precision
         if backbone_path:
             from transformers import AutoConfig

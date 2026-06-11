@@ -78,7 +78,15 @@ def build_processor(model_name: str, transformers_loading_kwargs: dict) -> Qwen3
             "Qwen3VLProcessor is not available. "
             "Please upgrade transformers: pip install transformers>=4.52.0"
         )
-    return Qwen3VLProcessor.from_pretrained(model_name, **transformers_loading_kwargs)
+    # Patch is_base_mistral to skip HuggingFace API call during tokenizer loading.
+    # This function is irrelevant for Qwen3VL but triggers network requests that
+    # fail in offline environments.
+    import transformers.tokenization_utils_base as _tub
+    if hasattr(_tub, "is_base_mistral"):
+        _tub.is_base_mistral = lambda *a, **kw: False
+    return Qwen3VLProcessor.from_pretrained(
+        model_name, local_files_only=True, **transformers_loading_kwargs
+    )
 
 
 class Gr00tN1d7DataCollator:
