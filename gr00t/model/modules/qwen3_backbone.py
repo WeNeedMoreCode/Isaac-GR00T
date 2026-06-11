@@ -71,6 +71,7 @@ class Qwen3Backbone(torch.nn.Module):
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_name,
             **extra_kwargs,
+            local_files_only=True,
             **transformers_loading_kwargs,
         ).eval()
 
