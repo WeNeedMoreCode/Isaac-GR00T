@@ -23,7 +23,6 @@ logs/
 runs/
 out/
 recordings/
-syx_records/
 plots/
 *.npz
 
