@@ -381,6 +381,7 @@ def run_single_trajectory(
     steps=300,
     action_horizon=16,
     skip_timing_steps=1,
+    pipeline_overlap=True,
 ):
     """
     Run inference on a single trajectory.
@@ -428,11 +429,14 @@ def run_single_trajectory(
     modality_configs = deepcopy(loader.modality_configs)
     modality_configs.pop("action")
 
-    # Inference loop with CPU/NPU pipeline overlap
+    # Inference loop
     num_inference_steps = len(range(0, actual_steps, action_horizon))
     logging.info(f"\nRunning {num_inference_steps} inference steps...")
     logging.info(f"(Skipping first {skip_timing_steps} step(s) for timing statistics)")
-    logging.info("Using pipeline overlap: CPU prepares step i+1 while NPU runs step i")
+    if pipeline_overlap:
+        logging.info("Using pipeline overlap: CPU prepares step i+1 while NPU runs step i")
+    else:
+        logging.info("Pipeline overlap disabled: synchronous mode")
     logging.info("-" * 80)
 
     # List of step counts to process
@@ -449,33 +453,46 @@ def run_single_trajectory(
             f"\n[Step {step_idx + 1}/{num_inference_steps}] Processing timestep {step_count}"
         )
 
-        # Step 1: Dispatch NPU inference (async, returns quickly)
         inference_start = time.time()
-        model_pred = policy.dispatch_inference(collated_inputs)
-
-        # Step 2: CPU work for next step WHILE NPU runs (pipeline overlap)
         data_prep_time = 0.0
-        if step_idx + 1 < len(step_counts):
-            next_step_count = step_counts[step_idx + 1]
-            t0 = time.time()
-            parsed_obs_next = prepare_observation_data(
-                traj, next_step_count, modality_configs, embodiment_tag, loader
-            )
-            collated_next, states_next = policy.prepare_inputs(parsed_obs_next)
-            data_prep_time = time.time() - t0
 
-        # Step 3: Wait for NPU and decode action (triggers NPU sync)
-        _action_chunk, _ = policy.decode_action(model_pred, states)
-        inference_time = time.time() - inference_start
+        if pipeline_overlap:
+            # Async mode: dispatch NPU, overlap with CPU prep for next step
+            model_pred = policy.dispatch_inference(collated_inputs)
+
+            if step_idx + 1 < len(step_counts):
+                next_step_count = step_counts[step_idx + 1]
+                t0 = time.time()
+                parsed_obs_next = prepare_observation_data(
+                    traj, next_step_count, modality_configs, embodiment_tag, loader
+                )
+                collated_next, states_next = policy.prepare_inputs(parsed_obs_next)
+                data_prep_time = time.time() - t0
+
+            _action_chunk, _ = policy.decode_action(model_pred, states)
+            inference_time = time.time() - inference_start
+
+            if step_idx + 1 < len(step_counts):
+                collated_inputs, states = collated_next, states_next
+        else:
+            # Sync mode: prepare -> infer -> decode, no overlap
+            model_pred = policy.dispatch_inference(collated_inputs)
+            _action_chunk, _ = policy.decode_action(model_pred, states)
+            inference_time = time.time() - inference_start
+
+            if step_idx + 1 < len(step_counts):
+                next_step_count = step_counts[step_idx + 1]
+                t0 = time.time()
+                parsed_obs = prepare_observation_data(
+                    traj, next_step_count, modality_configs, embodiment_tag, loader
+                )
+                collated_inputs, states = policy.prepare_inputs(parsed_obs)
+                data_prep_time = time.time() - t0
 
         # Only record timing after skipping the first N steps (warmup)
         if step_idx >= skip_timing_steps:
             timing_dict["data_prep_times"].append(data_prep_time)
             timing_dict["inference_times"].append(inference_time)
-
-        # Prepare for next iteration
-        if step_idx + 1 < len(step_counts):
-            collated_inputs, states = collated_next, states_next
 
         # Action processing
         action_chunk = parse_action_gr00t(_action_chunk)
@@ -618,6 +635,9 @@ class ArgsConfig:
 
     skip_timing_steps: int = 1
     """Number of initial inference steps to skip when calculating timing statistics (default: 1 to exclude warmup)."""
+
+    no_pipeline: bool = False
+    """Disable CPU/NPU pipeline overlap (useful for debugging memory on shared-memory devices)."""
 
     get_performance_stats: bool = True
     """Agreegate and summarize timing and accuracy stats across several runs"""
@@ -779,6 +799,7 @@ def main(args: ArgsConfig):
             steps=args.steps,
             action_horizon=args.action_horizon,
             skip_timing_steps=args.skip_timing_steps,
+            pipeline_overlap=not args.no_pipeline,
         )
         pred_actions.append(pred_action_across_time)
 
