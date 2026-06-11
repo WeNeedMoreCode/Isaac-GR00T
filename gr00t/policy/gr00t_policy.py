@@ -563,13 +563,9 @@ class Gr00tPolicy(BasePolicy):
 
     def decode_action(self, model_pred: dict, states: list[dict]):
         """Wait for NPU, decode and unnormalize actions."""
-        import time
         import numpy as np
         from gr00t.data.types import ActionType
-        _prof = getattr(self, '_enable_profiling', False)
 
-        if _prof:
-            t0 = time.time()
         action_pred = model_pred["action_pred"]
         action_np = action_pred.float().cpu().numpy()
         action_horizon = len(self.modality_configs["action"].delta_indices)
@@ -599,15 +595,6 @@ class Gr00tPolicy(BasePolicy):
                     denorm = denorm + ref_state[:, None, :].astype(np.float32)
 
             casted_action[key] = denorm
-        if _prof:
-            t_decode = time.time() - t0
-
-        if _prof:
-            if not hasattr(self, '_prof_decode_step'):
-                self._prof_decode_step = 0
-            self._prof_decode_step += 1
-            if self._prof_decode_step <= 4:
-                print(f"[PROF] decode: total={t_decode*1000:.1f}ms")
 
         return casted_action, {}
 
