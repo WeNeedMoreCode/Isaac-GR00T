@@ -449,9 +449,6 @@ class Qwen3Backbone(torch.nn.Module):
         return hidden_states
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
-        _prof = getattr(self, '_enable_profiling', False)
-        if _prof:
-            import time
         self.set_frozen_modules_to_eval_mode()
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
@@ -466,8 +463,6 @@ class Qwen3Backbone(torch.nn.Module):
         vl_input["image_mask"] = image_mask
 
         # Step 1b: Position IDs (get_rope_index uses .tolist(), not compilable)
-        if _prof:
-            t_rope = time.time()
         qwen3vl_model = self.model.model
         position_ids, _ = qwen3vl_model.get_rope_index(
             vl_input["input_ids"],
@@ -483,34 +478,15 @@ class Qwen3Backbone(torch.nn.Module):
             text_position_ids = position_ids[0]
         vl_input["position_ids"] = position_ids
         vl_input["text_position_ids"] = text_position_ids
-        if _prof:
-            t_rope = time.time() - t_rope
 
         # Step 2: Preprocess (compilable with torchair)
-        if _prof:
-            t0 = time.time()
         lm_kwargs = self._preprocess_vl_input(vl_input)
-        if _prof:
-            t_preprocess = time.time() - t0
 
         # Step 3: Language model (compilable with torchair)
-        if _prof:
-            t0 = time.time()
         hidden_states = self._language_model_forward(**lm_kwargs)
-        if _prof:
-            t_lm = time.time() - t0
 
         # Step 4: Output processing
         attention_mask = vl_input["attention_mask"] == 1
-
-        if _prof:
-            if not hasattr(self, '_prof_step'):
-                self._prof_step = 0
-            self._prof_step += 1
-            if self._prof_step <= 4:
-                print(f"[PROF] backbone: rope_idx={t_rope*1000:.1f}ms  "
-                      f"preprocess={t_preprocess*1000:.1f}ms  lm={t_lm*1000:.1f}ms  "
-                      f"total={((t_rope+t_preprocess+t_lm)*1000):.1f}ms")
 
         return BatchFeature(
             data={
