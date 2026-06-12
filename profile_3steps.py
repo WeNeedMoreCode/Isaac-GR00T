@@ -20,17 +20,17 @@ policy.model.action_head.num_inference_timesteps = 1
 # Prepare dummy observation using real data
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.types import VLAStepData, MessageType
-from gr00t.data.dataset import LeRobotEpisodeLoader
+from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
 from copy import deepcopy
 
 loader = LeRobotEpisodeLoader(
     dataset_path="demo_data/droid_sample",
-    modality_configs=None,
+    modality_configs={},
     video_backend="decord",
 )
 traj = loader[0]
 modality_configs = deepcopy(loader.modality_configs)
-modality_configs.pop("action")
+modality_configs.pop("action", None)
 
 # Prepare first step
 data_point = traj[0]
