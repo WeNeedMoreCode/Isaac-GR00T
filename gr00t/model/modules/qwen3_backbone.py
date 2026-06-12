@@ -16,6 +16,7 @@
 import logging
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from transformers.feature_extraction_utils import BatchFeature
 
@@ -346,8 +347,7 @@ class Qwen3Backbone(torch.nn.Module):
 
         logger.info("Patched visual attention with reshape-based forward")
 
-    @staticmethod
-    def _conv3d_as_linear(pixel_values: torch.Tensor, proj: nn.Module) -> torch.Tensor:
+    def _conv3d_as_linear(self, pixel_values: torch.Tensor, proj: nn.Module) -> torch.Tensor:
         """Replace Conv3d(kernel=stride, no padding) with reshape + Linear for NPU compatibility."""
         in_c = proj.in_channels
         out_c = proj.out_channels
