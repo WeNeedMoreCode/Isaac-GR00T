@@ -115,6 +115,17 @@ class Gr00tPolicy(BasePolicy):
             patch_tensor_type_for_npu()
             patch_floordiv_for_rc()
 
+        def _mem_checkpoint(label):
+            import subprocess, time
+            time.sleep(1)
+            r = subprocess.run(["npu-smi", "info"], capture_output=True, text=True, timeout=10)
+            for line in r.stdout.splitlines():
+                if "HBM" in line or "Memory" in line or "memory" in line:
+                    print(f"[MEM] {label}: {line.strip()}")
+                    break
+
+        _mem_checkpoint("Before model loading")
+
         # Load the pretrained model and move to target device with float16 precision
         if backbone_path:
             from transformers import AutoConfig
@@ -124,8 +135,10 @@ class Gr00tPolicy(BasePolicy):
         else:
             model = AutoModel.from_pretrained(model_dir)
         model.eval()  # Set model to evaluation mode
+        _mem_checkpoint("After AutoModel.from_pretrained (CPU)")
         if is_npu:
             model = model.to(device=device, dtype=torch.float16)
+            _mem_checkpoint("After model.to(npu)")
             # Conv3D lacks a precompiled kernel under jit_compile=False.
             # Only needed when visual encoder runs in eager mode (not compiled by torchair).
             if not (compile and _COMPILE_VISUAL_ENCODER):
@@ -156,10 +169,12 @@ class Gr00tPolicy(BasePolicy):
 
             if nz_cast:
                 format_cast_to_nz(model)
+                _mem_checkpoint("After format_cast_to_nz (before gc)")
 
             import gc
             gc.collect()
             torch.npu.empty_cache()
+            _mem_checkpoint("After gc.collect + empty_cache")
 
             if compile and _COMPILE_VISUAL_ENCODER:
                 compile_for_npu(model.backbone, "_preprocess_vl_input")
@@ -182,6 +197,7 @@ class Gr00tPolicy(BasePolicy):
         )
         self.processor: BaseProcessor = AutoProcessor.from_pretrained(processor_dir)
         self.processor.eval()
+        _mem_checkpoint("After processor loading")
 
         # Store embodiment-specific configurations
         self.embodiment_tag = embodiment_tag

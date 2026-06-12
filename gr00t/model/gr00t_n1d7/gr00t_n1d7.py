@@ -332,11 +332,20 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Set initial actions as the sampled noise.
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
+        # RC device: StatelessRandomNormalV2 runs on aicpu and may fail,
+        # generate on CPU then move to device.
+        try:
+            from npu_utils import _is_rc_device
+            _rc = _is_rc_device()
+        except ImportError:
+            _rc = False
         actions = torch.randn(
             size=(batch_size, self.config.action_horizon, self.action_dim),
             dtype=vl_embeds.dtype,
-            device=device,
+            device="cpu" if _rc else device,
         )
+        if _rc:
+            actions = actions.to(device)
 
         dt = 1.0 / self.num_inference_timesteps
         vel_strength = torch.ones_like(actions)
