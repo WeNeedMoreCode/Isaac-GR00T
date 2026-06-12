@@ -660,8 +660,8 @@ class ArgsConfig:
     get_performance_stats: bool = True
     """Agreegate and summarize timing and accuracy stats across several runs"""
 
-    npu_profiler: str | None = None
-    """Output directory for torch_npu.profiler data. Set to a path to enable NPU-level profiling."""
+    profile: bool = False
+    """Enable torch_npu.profiler profiling (results saved to ./prof_result)."""
 
     seed: int = 42
     """Seed to use for reproducibility."""
@@ -800,7 +800,7 @@ def main(args: ArgsConfig):
 
     # NPU profiler wrapper
     npu_prof_ctx = None
-    if args.npu_profiler and args.device.startswith("npu"):
+    if args.profile and args.device.startswith("npu"):
         import torch_npu.profiler
 
         npu_prof_ctx = torch_npu.profiler.profile(
@@ -812,7 +812,7 @@ def main(args: ArgsConfig):
                 wait=2, warmup=1, active=2, repeat=1,
             ),
             on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
-                dir_name=args.npu_profiler,
+                dir_name="./prof_result",
                 analyse_flag=True,
             ),
             record_shapes=True,
@@ -823,7 +823,7 @@ def main(args: ArgsConfig):
             ),
         )
         npu_prof_ctx.__enter__()
-        logging.info("NPU profiler enabled, output: %s", args.npu_profiler)
+        logging.info("NPU profiler enabled, output: ./prof_result")
 
     for traj_id in args.traj_ids:
         if traj_id < 0 or traj_id >= len(dataset):
@@ -943,7 +943,7 @@ def main(args: ArgsConfig):
     # Close NPU profiler
     if npu_prof_ctx is not None:
         npu_prof_ctx.__exit__(None, None, None)
-        logging.info("NPU profiler data saved to: %s", args.npu_profiler)
+        logging.info("NPU profiler data saved to ./prof_result")
 
     logging.info("=" * 80)
     logging.info("Done")
