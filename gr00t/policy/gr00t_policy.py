@@ -24,7 +24,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import os: control which stages are compiled by torchair
+import os
+
+# NPU compilation flags: control which stages are compiled by torchair
 _COMPILE_VISUAL_ENCODER = True
 _COMPILE_LANGUAGE_MODEL = True
 _COMPILE_ACTION_HEAD = True
@@ -84,6 +86,7 @@ class Gr00tPolicy(BasePolicy):
         strict: bool = True,
         backbone_path: str | None = None,
         compile: bool = True,
+        nz_cast: bool = True,
     ):
         """Initialize the Gr00t Policy.
 
@@ -151,7 +154,8 @@ class Gr00tPolicy(BasePolicy):
         if is_npu:
             from npu_utils import compile_for_npu, format_cast_to_nz
 
-            format_cast_to_nz(model)
+            if nz_cast:
+                format_cast_to_nz(model)
 
             import gc
             gc.collect()
