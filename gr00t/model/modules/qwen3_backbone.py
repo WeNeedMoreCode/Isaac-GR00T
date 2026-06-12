@@ -232,6 +232,24 @@ class Qwen3Backbone(torch.nn.Module):
             [[1, 16, 16]] * 4, dtype=torch.long, device=visual.patch_embed.proj.weight.device
         )
 
+        # RC device: patch rot_pos_emb to avoid aicpu ops (.max().item(), .prod().sum().item())
+        if getattr(self, '_is_rc', None) is None:
+            try:
+                from npu_utils import _is_rc_device
+                self._is_rc = _is_rc_device()
+            except ImportError:
+                self._is_rc = False
+
+        if self._is_rc:
+            _orig_rot_pos_emb = visual.rot_pos_emb
+
+            def _rot_pos_emb_cpu_safe(grid_thw_tensor):
+                orig_device = grid_thw_tensor.device
+                result = _orig_rot_pos_emb(grid_thw_tensor.cpu())
+                return result.to(orig_device)
+
+            visual.rot_pos_emb = _rot_pos_emb_cpu_safe
+
         # 1. Position embeddings (from fast_pos_embed_interpolate)
         self._cached_visual_pos_embeds = visual.fast_pos_embed_interpolate(grid_thw)
 
