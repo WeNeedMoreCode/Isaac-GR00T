@@ -198,19 +198,12 @@ class Gr00tPolicy(BasePolicy):
             else model_dir
         )
 
-        # Override model_name in processor config to use local backbone path
+        # Override processor's model_name to use local backbone path
+        processor_kwargs = {}
         if backbone_path and is_npu:
-            import json
-            pc_file = processor_dir / "processor_config.json"
-            if pc_file.exists():
-                with open(pc_file) as f:
-                    pc_data = json.load(f)
-                if pc_data.get("model_name") != backbone_path:
-                    pc_data["model_name"] = backbone_path
-                    with open(pc_file, "w") as f:
-                        json.dump(pc_data, f)
+            processor_kwargs["model_name"] = backbone_path
 
-        self.processor: BaseProcessor = AutoProcessor.from_pretrained(processor_dir)
+        self.processor: BaseProcessor = AutoProcessor.from_pretrained(processor_dir, **processor_kwargs)
         self.processor.eval()
         _mem_checkpoint("After processor loading")
 
