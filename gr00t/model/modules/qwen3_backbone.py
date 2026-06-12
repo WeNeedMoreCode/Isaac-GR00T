@@ -328,6 +328,20 @@ class Qwen3Backbone(torch.nn.Module):
 
         logger.info("Patched visual attention with reshape-based forward")
 
+    @staticmethod
+    def _conv3d_as_linear(pixel_values: torch.Tensor, proj: nn.Module) -> torch.Tensor:
+        """Replace Conv3d(kernel=stride, no padding) with reshape + Linear for NPU compatibility."""
+        in_c = proj.in_channels
+        out_c = proj.out_channels
+        kt, kp, _ = proj.kernel_size
+        N = pixel_values.shape[0]
+        x_flat = pixel_values.reshape(N, in_c * kt * kp * kp).to(dtype=proj.weight.dtype)
+        # Use matmul + bias instead of nn.Linear to avoid creating extra parameters
+        out = x_flat @ proj.weight.data.reshape(out_c, -1).T
+        if proj.bias is not None:
+            out = out + proj.bias.data
+        return out.view(-1, out_c)
+
     def _compiled_visual_forward(self, pixel_values: torch.Tensor):
         """Visual encoder forward using cached position embeddings (compilable with torchair).
 
@@ -335,7 +349,18 @@ class Qwen3Backbone(torch.nn.Module):
         """
         visual = self.model.model.visual
 
-        hidden_states = visual.patch_embed(pixel_values)
+        # RC device: Conv3D lacks precompiled kernel, use reshape + matmul replacement
+        if getattr(self, '_use_conv3d_replacement', None) is None:
+            try:
+                from npu_utils import _is_rc_device
+                self._use_conv3d_replacement = _is_rc_device()
+            except ImportError:
+                self._use_conv3d_replacement = False
+
+        if self._use_conv3d_replacement:
+            hidden_states = self._conv3d_as_linear(pixel_values, visual.patch_embed.proj)
+        else:
+            hidden_states = visual.patch_embed(pixel_values)
         hidden_states = hidden_states + self._cached_visual_pos_embeds.to(
             hidden_states.device, hidden_states.dtype
         )
