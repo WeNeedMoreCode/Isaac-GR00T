@@ -119,10 +119,8 @@ class Gr00tPolicy(BasePolicy):
             import subprocess, time
             time.sleep(1)
             r = subprocess.run(["npu-smi", "info"], capture_output=True, text=True, timeout=10)
-            for line in r.stdout.splitlines():
-                if "HBM" in line or "Memory" in line or "memory" in line:
-                    print(f"[MEM] {label}: {line.strip()}")
-                    break
+            print(f"\n[MEM] === {label} ===")
+            print(r.stdout)
 
         _mem_checkpoint("Before model loading")
 
