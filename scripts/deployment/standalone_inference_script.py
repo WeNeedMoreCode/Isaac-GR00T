@@ -383,7 +383,7 @@ def run_single_trajectory(
     action_horizon=16,
     skip_timing_steps=1,
     pipeline_overlap=True,
-    profile=False,
+    npu_prof=None,
 ):
     """
     Run inference on a single trajectory.
@@ -450,28 +450,6 @@ def run_single_trajectory(
     )
     collated_inputs, states = policy.prepare_inputs(parsed_obs)
 
-    # Profiling wrapper
-    prof_ctx = None
-    if profile:
-        import torch_npu
-        prof_ctx = torch_npu.profiler.profile(
-            activities=[
-                torch_npu.profiler.ProfilerActivity.CPU,
-                torch_npu.ProfilerActivity.NPU,
-            ],
-            schedule=torch_npu.profiler.schedule(wait=0, warmup=1, active=2, repeat=1),
-            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("./prof_result"),
-            record_shapes=True,
-            with_stack=True,
-            experimental_config=torch_npu.profiler._ExperimentalConfig(
-                export_type=[torch_npu.profiler.ExportType.Text],
-                profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
-                data_simplification=True,
-            ),
-        )
-        prof_ctx.__enter__()
-        logging.info("Profiling enabled: 1 warmup + 2 active steps, results -> ./prof_result/")
-
     for step_idx, step_count in enumerate(step_counts):
         logging.info(
             f"\n[Step {step_idx + 1}/{num_inference_steps}] Processing timestep {step_count}"
@@ -519,9 +497,9 @@ def run_single_trajectory(
         gc.collect()
         torch.npu.empty_cache()
 
-        # Profiler step
-        if prof_ctx is not None:
-            prof_ctx.step()
+        # Notify NPU profiler of step boundary
+        if npu_prof is not None:
+            npu_prof.step()
 
         # Only record timing after skipping the first N steps (warmup)
         if step_idx >= skip_timing_steps:
@@ -544,12 +522,6 @@ def run_single_trajectory(
 
     logging.info("\n" + "-" * 80)
     logging.info(f"All inference steps completed for current trajectory-id {traj_id}")
-
-    # Finalize profiler
-    if prof_ctx is not None:
-        prof_ctx.__exit__(None, None, None)
-        logging.info("Profiling done. Results saved to ./prof_result/")
-        logging.info("View with: mindstudio-insight ./prof_result/")
 
     obs = []
     for key in parsed_obs.keys():
@@ -688,8 +660,8 @@ class ArgsConfig:
     get_performance_stats: bool = True
     """Agreegate and summarize timing and accuracy stats across several runs"""
 
-    profile: bool = False
-    """Enable torch_npu.profiler profiling for the first 3 inference steps."""
+    npu_profiler: str | None = None
+    """Output directory for torch_npu.profiler data. Set to a path to enable NPU-level profiling."""
 
     seed: int = 42
     """Seed to use for reproducibility."""
@@ -826,6 +798,33 @@ def main(args: ArgsConfig):
     pred_actions = []
     obs = None
 
+    # NPU profiler wrapper
+    npu_prof_ctx = None
+    if args.npu_profiler and args.device.startswith("npu"):
+        import torch_npu.profiler
+
+        npu_prof_ctx = torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU,
+            ],
+            schedule=torch_npu.profiler.schedule(
+                wait=2, warmup=1, active=2, repeat=1,
+            ),
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                dir_name=args.npu_profiler,
+                analyse_flag=True,
+            ),
+            record_shapes=True,
+            with_stack=True,
+            experimental_config=torch_npu.profiler._ExperimentalConfig(
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+                data_simplification=True,
+            ),
+        )
+        npu_prof_ctx.__enter__()
+        logging.info("NPU profiler enabled, output: %s", args.npu_profiler)
+
     for traj_id in args.traj_ids:
         if traj_id < 0 or traj_id >= len(dataset):
             logging.warning(
@@ -851,7 +850,7 @@ def main(args: ArgsConfig):
             action_horizon=args.action_horizon,
             skip_timing_steps=args.skip_timing_steps,
             pipeline_overlap=not args.no_pipeline,
-            profile=args.profile,
+            npu_prof=npu_prof_ctx,
         )
         pred_actions.append(pred_action_across_time)
 
@@ -940,6 +939,11 @@ def main(args: ArgsConfig):
         raise ValueError(
             f"No valid trajectories to process. Requested IDs {args.traj_ids} are all out of range (dataset has {len(dataset)} trajectories, valid IDs: 0-{len(dataset) - 1})."
         )
+
+    # Close NPU profiler
+    if npu_prof_ctx is not None:
+        npu_prof_ctx.__exit__(None, None, None)
+        logging.info("NPU profiler data saved to: %s", args.npu_profiler)
 
     logging.info("=" * 80)
     logging.info("Done")
