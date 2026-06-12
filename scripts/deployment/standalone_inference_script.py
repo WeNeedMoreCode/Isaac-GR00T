@@ -32,6 +32,7 @@ from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.policy.gr00t_policy import Gr00tPolicy
 from gr00t.policy.policy import BasePolicy
 from matplotlib import pyplot as plt
+import gc
 import numpy as np
 import pandas as pd
 import torch
@@ -476,6 +477,8 @@ def run_single_trajectory(
                 collated_inputs, states = collated_next, states_next
         else:
             # Sync mode: prepare -> infer -> decode, no overlap
+            if step_idx == 0:
+                logging.info(">> Entered synchronous path (no pipeline overlap)")
             model_pred = policy.dispatch_inference(collated_inputs)
             _action_chunk, _ = policy.decode_action(model_pred, states)
             inference_time = time.time() - inference_start
@@ -488,6 +491,10 @@ def run_single_trajectory(
                 )
                 collated_inputs, states = policy.prepare_inputs(parsed_obs)
                 data_prep_time = time.time() - t0
+
+        # GC after each step to release intermediate tensors
+        gc.collect()
+        torch.npu.empty_cache()
 
         # Only record timing after skipping the first N steps (warmup)
         if step_idx >= skip_timing_steps:

@@ -24,8 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-
-# NPU compilation flags: control which stages are compiled by torchair
+import os: control which stages are compiled by torchair
 _COMPILE_VISUAL_ENCODER = True
 _COMPILE_LANGUAGE_MODEL = True
 _COMPILE_ACTION_HEAD = True
@@ -113,9 +112,6 @@ class Gr00tPolicy(BasePolicy):
             patch_tensor_type_for_npu()
             patch_floordiv_for_rc()
 
-        # Prevent transformers from reaching HuggingFace Hub during local loading
-        os.environ["HF_HUB_OFFLINE"] = "1"
-
         # Load the pretrained model and move to target device with float16 precision
         if backbone_path:
             from transformers import AutoConfig
@@ -129,7 +125,7 @@ class Gr00tPolicy(BasePolicy):
             model = model.to(device=device, dtype=torch.float16)
             # Conv3D lacks a precompiled kernel under jit_compile=False.
             # Only needed when visual encoder runs in eager mode (not compiled by torchair).
-            if not _COMPILE_VISUAL_ENCODER:
+            if not (compile and _COMPILE_VISUAL_ENCODER):
                 try:
                     patch_embed = model.backbone.model.model.visual.patch_embed
                     _orig_forward = patch_embed.forward
@@ -156,6 +152,11 @@ class Gr00tPolicy(BasePolicy):
             from npu_utils import compile_for_npu, format_cast_to_nz
 
             format_cast_to_nz(model)
+
+            import gc
+            gc.collect()
+            torch.npu.empty_cache()
+
             if compile and _COMPILE_VISUAL_ENCODER:
                 compile_for_npu(model.backbone, "_preprocess_vl_input")
             if compile and _COMPILE_LANGUAGE_MODEL:
