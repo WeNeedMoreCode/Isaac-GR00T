@@ -125,18 +125,22 @@ class Gr00tPolicy(BasePolicy):
         _mem_checkpoint("Before model loading")
 
         # Load the pretrained model and move to target device with float16 precision
+        load_kwargs = {}
+        if is_npu:
+            load_kwargs["device_map"] = device
+            load_kwargs["torch_dtype"] = torch.float16
         if backbone_path:
             from transformers import AutoConfig
             _cfg = AutoConfig.from_pretrained(model_dir)
             _cfg.model_name = backbone_path
-            model = AutoModel.from_pretrained(model_dir, config=_cfg)
+            model = AutoModel.from_pretrained(model_dir, config=_cfg, **load_kwargs)
         else:
-            model = AutoModel.from_pretrained(model_dir)
+            model = AutoModel.from_pretrained(model_dir, **load_kwargs)
         model.eval()  # Set model to evaluation mode
-        _mem_checkpoint("After AutoModel.from_pretrained (CPU)")
-        if is_npu:
+        _mem_checkpoint("After AutoModel.from_pretrained (direct to device)")
+        if is_npu and model.device.type != "npu":
             model = model.to(device=device, dtype=torch.float16)
-            _mem_checkpoint("After model.to(npu)")
+            _mem_checkpoint("After model.to(npu) (fallback)")
             # Conv3D lacks a precompiled kernel under jit_compile=False.
             # Only needed when visual encoder runs in eager mode (not compiled by torchair).
             if not (compile and _COMPILE_VISUAL_ENCODER):
