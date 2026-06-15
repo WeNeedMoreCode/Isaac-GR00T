@@ -141,29 +141,30 @@ class Gr00tPolicy(BasePolicy):
         if is_npu and model.device.type != "npu":
             model = model.to(device=device, dtype=torch.float16)
             _mem_checkpoint("After model.to(npu) (fallback)")
-            # Conv3D lacks a precompiled kernel under jit_compile=False.
-            # Only needed when visual encoder runs in eager mode (not compiled by torchair).
-            if not (compile and _COMPILE_VISUAL_ENCODER):
-                try:
-                    patch_embed = model.backbone.model.model.visual.patch_embed
-                    _orig_forward = patch_embed.forward
-
-                    def _selective_jit_conv3d(x):
-                        import torch_npu
-
-                        torch_npu.npu.set_compile_mode(jit_compile=True)
-                        try:
-                            out = _orig_forward(x)
-                        finally:
-                            torch_npu.npu.set_compile_mode(jit_compile=False)
-                        return out
-
-                    patch_embed.forward = _selective_jit_conv3d
-                    print("[NPU] patch_embed -> selective JIT mode")
-                except Exception as e:
-                    print(f"[NPU] patch_embed selective JIT failed: {e}")
         else:
             model.to(device=device, dtype=torch.float16)
+
+        # Conv3D lacks a precompiled kernel under jit_compile=False.
+        # Only needed when visual encoder runs in eager mode (not compiled by torchair).
+        if is_npu and not (compile and _COMPILE_VISUAL_ENCODER):
+            try:
+                patch_embed = model.backbone.model.model.visual.patch_embed
+                _orig_forward = patch_embed.forward
+
+                def _selective_jit_conv3d(x):
+                    import torch_npu
+
+                    torch_npu.npu.set_compile_mode(jit_compile=True)
+                    try:
+                        out = _orig_forward(x)
+                    finally:
+                        torch_npu.npu.set_compile_mode(jit_compile=False)
+                    return out
+
+                patch_embed.forward = _selective_jit_conv3d
+                print("[NPU] patch_embed -> selective JIT mode")
+            except Exception as e:
+                print(f"[NPU] patch_embed selective JIT failed: {e}")
 
         # NPU adaptation: FRACTAL_NZ + torchair compile
         if is_npu:
