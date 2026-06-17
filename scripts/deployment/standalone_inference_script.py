@@ -384,6 +384,7 @@ def run_single_trajectory(
     skip_timing_steps=1,
     pipeline_overlap=True,
     npu_prof=None,
+    step_start=0,
 ):
     """
     Run inference on a single trajectory.
@@ -442,7 +443,7 @@ def run_single_trajectory(
     logging.info("-" * 80)
 
     # List of step counts to process
-    step_counts = list(range(0, actual_steps, action_horizon))
+    step_counts = [sc for sc in range(0, actual_steps, action_horizon) if sc >= step_start]
 
     # Prepare first step (CPU only, synchronous)
     parsed_obs = prepare_observation_data(
@@ -637,6 +638,9 @@ class ArgsConfig:
     steps: int = 200
     """Maximum number of steps to evaluate (will be capped by trajectory length)."""
 
+    step_start: int = 0
+    """For subprocess isolation on RC devices: skip steps before this timestep. Default 0."""
+
     traj_ids: list[int] = field(default_factory=lambda: [0])
     """List of trajectory IDs to evaluate."""
 
@@ -692,7 +696,95 @@ class ArgsConfig:
     """Local path to backbone model (e.g. ./checkpoints/Cosmos-Reason2-2B). Overrides config.model_name."""
 
 
+# On RC devices (Ascend 310P1), the driver leaks ~340 events per inference call,
+# hitting the 1024 event pool limit at the 3rd call. Subprocess isolation works
+# around this: each subprocess does at most STEPS_PER_BATCH inference calls,
+# then exits to release the event pool. torchair compile cache is on disk and
+# shared across subprocesses, so only the first subprocess pays compile cost.
+_GR00T_STEPS_PER_BATCH = 2
+
+
+def _orchestrate_subprocess(args: ArgsConfig):
+    """Spawn one subprocess per (trajectory, step batch) to bypass event pool leak."""
+    import subprocess as sp
+    import sys
+
+    logging.info("=" * 80)
+    logging.info(f"[orchestrator] RC device: subprocess isolation ON, "
+                 f"{_GR00T_STEPS_PER_BATCH} steps per subprocess")
+    logging.info("=" * 80)
+
+    for traj_id in args.traj_ids:
+        step_start = 0
+        batch_idx = 0
+        while step_start < args.steps:
+            step_end = min(step_start + _GR00T_STEPS_PER_BATCH * args.action_horizon, args.steps)
+            out_file = f"/tmp/gr00t_pred_traj{traj_id}_batch{batch_idx}.npy"
+
+            # Inherit current argv but override traj-ids / steps / step-start
+            sub_argv = []
+            skip_next = False
+            for a in sys.argv[1:]:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if a in ("--traj-ids", "--steps", "--step-start"):
+                    skip_next = True
+                    continue
+                if a.startswith(("--traj-ids=", "--steps=", "--step-start=")):
+                    continue
+                sub_argv.append(a)
+            sub_argv += [
+                "--traj-ids", str(traj_id),
+                "--steps", str(step_end),
+                "--step-start", str(step_start),
+            ]
+
+            env = os.environ.copy()
+            env["_GR00T_WORKER"] = "1"
+            env["_GR00T_OUT_FILE"] = out_file
+
+            logging.info(f"[orchestrator] traj {traj_id} batch {batch_idx}: "
+                         f"step_start={step_start} step_end={step_end}")
+            r = sp.run([sys.executable] + sys.argv[:1] + sub_argv, env=env)
+            if r.returncode != 0:
+                raise RuntimeError(
+                    f"subprocess failed: traj {traj_id} batch {batch_idx} (exit {r.returncode})"
+                )
+
+            if os.path.exists(out_file):
+                import numpy as np
+                preds = np.load(out_file)
+                logging.info(f"[orchestrator] batch {batch_idx} done, "
+                             f"predicted {len(preds)} actions")
+                os.remove(out_file)
+
+            step_start = step_end
+            batch_idx += 1
+
+    logging.info("=" * 80)
+    logging.info("[orchestrator] all trajectories completed")
+    logging.info("=" * 80)
+    return [], None
+
+
 def main(args: ArgsConfig):
+    # Orchestrator mode: spawn subprocess per step batch on RC devices to bypass
+    # the 1024 event pool limit. Worker mode (_GR00T_WORKER=1) runs normally.
+    is_worker = os.environ.get("_GR00T_WORKER") == "1"
+    if (
+        not is_worker
+        and args.device.startswith("npu")
+        and not args.profile
+    ):
+        try:
+            from npu_utils import _is_rc_device
+
+            if _is_rc_device():
+                return _orchestrate_subprocess(args)
+        except Exception as e:
+            logging.warning(f"RC detection failed, running in single process: {e}")
+
     # NPU initialization
     if args.device.startswith("npu"):
         import torch_npu
@@ -870,6 +962,7 @@ def main(args: ArgsConfig):
             skip_timing_steps=args.skip_timing_steps,
             pipeline_overlap=not args.no_pipeline,
             npu_prof=npu_prof_ctx,
+            step_start=args.step_start,
         )
         pred_actions.append(pred_action_across_time)
 
@@ -963,6 +1056,14 @@ def main(args: ArgsConfig):
     if npu_prof_ctx is not None:
         npu_prof_ctx.__exit__(None, None, None)
         logging.info("NPU profiler data saved to ./prof_result")
+
+    # Worker mode: save predictions for orchestrator to pick up, then exit.
+    if os.environ.get("_GR00T_WORKER") == "1":
+        out_file = os.environ.get("_GR00T_OUT_FILE")
+        if out_file and pred_actions:
+            np.save(out_file, pred_actions[-1])
+            logging.info(f"[worker] saved predictions to {out_file}")
+        return [], None
 
     logging.info("=" * 80)
     logging.info("Done")
