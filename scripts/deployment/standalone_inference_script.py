@@ -497,8 +497,23 @@ def run_single_trajectory(
         # Without this, Ascend driver event pool (max 1024) leaks on RC,
         # causing "event resources are used up" dmesg spam and 0% AICore.
         torch.npu.synchronize()
+
+        # Memory tracking at step boundary (in-process, no external sampling lag)
+        logging.info(
+            f"[MEM] step {step_idx+1}/{num_inference_steps} "
+            f"alloc={torch.npu.memory_allocated()/1e9:.2f}GB "
+            f"reserved={torch.npu.memory_reserved()/1e9:.2f}GB"
+        )
+
         gc.collect()
         torch.npu.empty_cache()
+
+        # After GC + empty_cache: see how much was actually released
+        logging.info(
+            f"[MEM] step {step_idx+1} after GC "
+            f"alloc={torch.npu.memory_allocated()/1e9:.2f}GB "
+            f"reserved={torch.npu.memory_reserved()/1e9:.2f}GB"
+        )
 
         # Notify NPU profiler of step boundary
         if npu_prof is not None:
