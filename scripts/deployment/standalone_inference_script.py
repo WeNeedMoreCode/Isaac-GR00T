@@ -498,22 +498,19 @@ def run_single_trajectory(
         # causing "event resources are used up" dmesg spam and 0% AICore.
         torch.npu.synchronize()
 
-        # Memory tracking at step boundary.
-        # Sleep 2s before to let any pending async work settle,
-        # sleep 2s after so npu-smi's ~1s exec doesn't bleed into next step.
+        # Memory tracking at step boundary
         time.sleep(2)
         import subprocess as _sp
-        try:
-            _smi = _sp.run(["npu-smi", "info"], capture_output=True, text=True, timeout=3).stdout
-            _phys = next((l for l in _smi.splitlines() if "Memory-Usage" in l), "?")
-        except Exception:
-            _phys = "npu-smi failed"
         logging.info(
             f"[MEM] step {step_idx+1}/{num_inference_steps} "
             f"pytorch_alloc={torch.npu.memory_allocated()/1e9:.2f}GB "
-            f"pytorch_reserved={torch.npu.memory_reserved()/1e9:.2f}GB | "
-            f"phys: {_phys.strip()}"
+            f"pytorch_reserved={torch.npu.memory_reserved()/1e9:.2f}GB"
         )
+        try:
+            _r = _sp.run(["npu-smi", "info"], capture_output=True, text=True, timeout=10)
+            print(_r.stdout)
+        except Exception as _e:
+            logging.error(f"npu-smi failed: {_e}")
         time.sleep(2)
 
         gc.collect()
