@@ -709,10 +709,11 @@ def _orchestrate_subprocess(args: ArgsConfig):
     import subprocess as sp
     import sys
 
-    logging.info("=" * 80)
-    logging.info(f"[orchestrator] RC device: subprocess isolation ON, "
-                 f"{_GR00T_STEPS_PER_BATCH} steps per subprocess")
-    logging.info("=" * 80)
+    # Use print, not logging: logging isn't configured yet at this point in main().
+    print("=" * 80)
+    print(f"[orchestrator] RC device: subprocess isolation ON, "
+          f"{_GR00T_STEPS_PER_BATCH} steps per subprocess")
+    print("=" * 80)
 
     for traj_id in args.traj_ids:
         step_start = 0
@@ -744,8 +745,8 @@ def _orchestrate_subprocess(args: ArgsConfig):
             env["_GR00T_WORKER"] = "1"
             env["_GR00T_OUT_FILE"] = out_file
 
-            logging.info(f"[orchestrator] traj {traj_id} batch {batch_idx}: "
-                         f"step_start={step_start} step_end={step_end}")
+            print(f"\n[orchestrator] traj {traj_id} batch {batch_idx}: "
+                  f"step_start={step_start} step_end={step_end}")
             r = sp.run([sys.executable] + sys.argv[:1] + sub_argv, env=env)
             if r.returncode != 0:
                 raise RuntimeError(
@@ -755,22 +756,22 @@ def _orchestrate_subprocess(args: ArgsConfig):
             if os.path.exists(out_file):
                 import numpy as np
                 preds = np.load(out_file)
-                logging.info(f"[orchestrator] batch {batch_idx} done, "
-                             f"predicted {len(preds)} actions")
+                print(f"[orchestrator] batch {batch_idx} done, "
+                      f"predicted {len(preds)} actions")
                 os.remove(out_file)
             else:
                 # Worker produced no output → trajectory exhausted. Stop spawning
                 # further batches for this trajectory to avoid wasting model loads.
-                logging.info(f"[orchestrator] batch {batch_idx} empty, "
-                             f"trajectory {traj_id} ended at step_start={step_start}")
+                print(f"[orchestrator] batch {batch_idx} empty, "
+                      f"trajectory {traj_id} ended at step_start={step_start}")
                 break
 
             step_start = step_end
             batch_idx += 1
 
-    logging.info("=" * 80)
-    logging.info("[orchestrator] all trajectories completed")
-    logging.info("=" * 80)
+    print("=" * 80)
+    print("[orchestrator] all trajectories completed")
+    print("=" * 80)
     return [], None
 
 
