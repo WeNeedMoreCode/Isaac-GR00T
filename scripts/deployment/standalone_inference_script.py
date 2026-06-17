@@ -747,21 +747,43 @@ def _orchestrate_subprocess(args: ArgsConfig):
 
             print(f"\n[orchestrator] traj {traj_id} batch {batch_idx}: "
                   f"step_start={step_start} step_end={step_end}")
-            r = sp.run([sys.executable] + sys.argv[:1] + sub_argv, env=env)
-            if r.returncode != 0:
-                raise RuntimeError(
-                    f"subprocess failed: traj {traj_id} batch {batch_idx} (exit {r.returncode})"
-                )
+
+            # Spawn subprocess non-blocking, then poll for output file.
+            # Once the worker saves predictions, kill it — clean exit hangs on
+            # NPU cleanup (driver waits for events that will never complete).
+            import time
+            proc = sp.Popen([sys.executable] + sys.argv[:1] + sub_argv, env=env)
+            max_wait = 600  # 10 min hard cap for model load + 2 inferences
+            t0 = time.time()
+            killed = False
+            while True:
+                # Worker wrote the output file → done, kill before cleanup hangs
+                if os.path.exists(out_file):
+                    print(f"[orchestrator] predictions saved, killing subprocess "
+                          f"to skip NPU cleanup hang")
+                    proc.kill()
+                    proc.wait(timeout=30)
+                    killed = True
+                    break
+                # Subprocess died before saving (real error or trajectory ended)
+                if proc.poll() is not None:
+                    break
+                if time.time() - t0 > max_wait:
+                    print(f"[orchestrator] TIMEOUT after {max_wait}s, killing")
+                    proc.kill()
+                    proc.wait(timeout=30)
+                    break
+                time.sleep(2)
 
             if os.path.exists(out_file):
                 import numpy as np
                 preds = np.load(out_file)
                 print(f"[orchestrator] batch {batch_idx} done, "
-                      f"predicted {len(preds)} actions")
+                      f"predicted {len(preds)} actions"
+                      f"{' (killed after save)' if killed else ''}")
                 os.remove(out_file)
             else:
-                # Worker produced no output → trajectory exhausted. Stop spawning
-                # further batches for this trajectory to avoid wasting model loads.
+                # Worker produced no output → trajectory exhausted.
                 print(f"[orchestrator] batch {batch_idx} empty, "
                       f"trajectory {traj_id} ended at step_start={step_start}")
                 break
