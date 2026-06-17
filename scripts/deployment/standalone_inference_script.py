@@ -758,6 +758,12 @@ def _orchestrate_subprocess(args: ArgsConfig):
                 logging.info(f"[orchestrator] batch {batch_idx} done, "
                              f"predicted {len(preds)} actions")
                 os.remove(out_file)
+            else:
+                # Worker produced no output → trajectory exhausted. Stop spawning
+                # further batches for this trajectory to avoid wasting model loads.
+                logging.info(f"[orchestrator] batch {batch_idx} empty, "
+                             f"trajectory {traj_id} ended at step_start={step_start}")
+                break
 
             step_start = step_end
             batch_idx += 1
