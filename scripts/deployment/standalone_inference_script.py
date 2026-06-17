@@ -493,7 +493,10 @@ def run_single_trajectory(
                 collated_inputs, states = policy.prepare_inputs(parsed_obs)
                 data_prep_time = time.time() - t0
 
-        # GC after each step to release intermediate tensors
+        # Force NPU sync to release pending events, then GC + empty cache.
+        # Without this, Ascend driver event pool (max 1024) leaks on RC,
+        # causing "event resources are used up" dmesg spam and 0% AICore.
+        torch.npu.synchronize()
         gc.collect()
         torch.npu.empty_cache()
 
