@@ -432,8 +432,11 @@ def run_single_trajectory(
     modality_configs = deepcopy(loader.modality_configs)
     modality_configs.pop("action")
 
+    # List of step counts to process (filtered by step_start for subprocess mode)
+    step_counts = [sc for sc in range(0, actual_steps, action_horizon) if sc >= step_start]
+
     # Inference loop
-    num_inference_steps = len(range(0, actual_steps, action_horizon))
+    num_inference_steps = len(step_counts)
     logging.info(f"\nRunning {num_inference_steps} inference steps...")
     logging.info(f"(Skipping first {skip_timing_steps} step(s) for timing statistics)")
     if pipeline_overlap:
@@ -441,9 +444,6 @@ def run_single_trajectory(
     else:
         logging.info("Pipeline overlap disabled: synchronous mode")
     logging.info("-" * 80)
-
-    # List of step counts to process
-    step_counts = [sc for sc in range(0, actual_steps, action_horizon) if sc >= step_start]
 
     # Prepare first step (CPU only, synchronous)
     parsed_obs = prepare_observation_data(
@@ -1002,6 +1002,14 @@ def main(args: ArgsConfig):
             step_start=args.step_start,
         )
         pred_actions.append(pred_action_across_time)
+
+        # In worker mode (subprocess isolation), pred only covers step_start..step_end,
+        # but evaluate_predictions expects full trajectory coverage → dimension mismatch.
+        # Skip evaluation here; orchestrator combines all batches later.
+        if is_worker:
+            logging.info(f"[worker] ran {len(pred_action_across_time)} actions, "
+                         f"skipping evaluate_predictions (orchestrator will combine)")
+            continue
 
         if args.get_performance_stats:
             mse, mae = evaluate_predictions(
