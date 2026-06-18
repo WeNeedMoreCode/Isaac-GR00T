@@ -507,6 +507,12 @@ def run_single_trajectory(
         if npu_prof is not None:
             npu_prof.step()
 
+        # Per-step time printed regardless of skip (helps spot which step is the outlier)
+        logging.info(
+            f"[TIME] step_idx={step_idx} inference={inference_time*1000:.1f}ms "
+            f"data_prep={data_prep_time*1000:.1f}ms"
+        )
+
         # Only record timing after skipping the first N steps (warmup)
         if step_idx >= skip_timing_steps:
             timing_dict["data_prep_times"].append(data_prep_time)
