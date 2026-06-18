@@ -500,20 +500,6 @@ def run_single_trajectory(
         torch.npu.synchronize()
 
         # Memory tracking at step boundary
-        time.sleep(2)
-        import subprocess as _sp
-        logging.info(
-            f"[MEM] step {step_idx+1}/{num_inference_steps} "
-            f"pytorch_alloc={torch.npu.memory_allocated()/1e9:.2f}GB "
-            f"pytorch_reserved={torch.npu.memory_reserved()/1e9:.2f}GB"
-        )
-        try:
-            _r = _sp.run(["npu-smi", "info"], capture_output=True, text=True, timeout=10)
-            print(_r.stdout)
-        except Exception as _e:
-            logging.error(f"npu-smi failed: {_e}")
-        time.sleep(2)
-
         gc.collect()
         torch.npu.empty_cache()
 
