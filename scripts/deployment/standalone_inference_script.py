@@ -39,33 +39,6 @@ import torch
 import torch_npu
 import tyro
 
-# Instrument: count Python-level NPU Event create/destroy to diagnose pool leak.
-# Only catches events that go through torch.npu.Event(); misses C++ internal ones.
-# Note: Python __del__ should call aclrtDestroyEvent internally. If Python delta
-# (created - destroyed) stays low but driver pool still exhausts, the leak is in
-# the C++ layer (Python destroyed but driver didn't return ID to pool).
-_event_create_count = 0
-_event_destroy_count = 0
-_orig_npu_event_init = torch_npu.npu.Event.__init__
-_orig_npu_event_del = getattr(torch_npu.npu.Event, "__del__", None)
-
-
-def _counted_npu_event_init(self, *args, **kwargs):
-    global _event_create_count
-    _event_create_count += 1
-    return _orig_npu_event_init(self, *args, **kwargs)
-
-
-def _counted_npu_event_del(self):
-    global _event_destroy_count
-    _event_destroy_count += 1
-    if _orig_npu_event_del is not None:
-        return _orig_npu_event_del(self)
-
-
-torch_npu.npu.Event.__init__ = _counted_npu_event_init
-torch_npu.npu.Event.__del__ = _counted_npu_event_del
-
 
 warnings.simplefilter("ignore", category=FutureWarning)
 
@@ -534,11 +507,6 @@ def run_single_trajectory(
             f"pytorch_alloc={torch.npu.memory_allocated()/1e9:.2f}GB "
             f"pytorch_reserved={torch.npu.memory_reserved()/1e9:.2f}GB"
         )
-        logging.info(
-            f"[EVT] step {step_idx+1}/{num_inference_steps} "
-            f"created={_event_create_count} destroyed={_event_destroy_count} "
-            f"alive={_event_create_count - _event_destroy_count}"
-        )
         try:
             _r = _sp.run(["npu-smi", "info"], capture_output=True, text=True, timeout=10)
             print(_r.stdout)
@@ -843,7 +811,6 @@ def main(args: ArgsConfig):
     ):
         print("[main] _GR00T_FORCE_SUBPROCESS=1, using subprocess isolation")
         return _orchestrate_subprocess(args)
-            logging.warning(f"RC detection failed, running in single process: {e}")
 
     # NPU initialization
     if args.device.startswith("npu"):
