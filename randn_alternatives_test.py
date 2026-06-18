@@ -1,72 +1,57 @@
 """测试 RC 设备上 torch.empty + 原地随机填充方案。
 
-每个子进程独立跑，避免失败时污染 NPU context。
+用法：
+  python randn_alternatives_test.py                  # 默认测 normal_（randn 的平替）
+  python randn_alternatives_test.py --method normal
+  python randn_alternatives_test.py --method uniform
+  python randn_alternatives_test.py --method bernoulli
+
+注意：只有 normal_() 跟 torch.randn 同分布（高斯），是真正的平替。
+      uniform_ 和 bernoulli_ 分布不同，只是顺便验证 NPU 上能不能跑原地随机算子。
 """
-import subprocess
-import sys
+import argparse
 import time
 
-METHODS = [
-    ("2a. empty + normal_()", """
-import torch, torch_npu
+import torch
+import torch_npu
+
 torch_npu.npu.set_compile_mode(jit_compile=False)
-x = torch.empty((16, 1024), device='npu:0', dtype=torch.float16).normal_()
-torch.npu.synchronize()
-print(f'shape={tuple(x.shape)} mean={x.float().mean().item():.4f} std={x.float().std().item():.4f}')
-"""),
-
-    ("2b. empty + uniform_(-1, 1)", """
-import torch, torch_npu
-torch_npu.npu.set_compile_mode(jit_compile=False)
-x = torch.empty((16, 1024), device='npu:0', dtype=torch.float16).uniform_(-1, 1)
-torch.npu.synchronize()
-print(f'shape={tuple(x.shape)} mean={x.float().mean().item():.4f} std={x.float().std().item():.4f}')
-"""),
-
-    ("2c. empty + bernoulli_(0.5)", """
-import torch, torch_npu
-torch_npu.npu.set_compile_mode(jit_compile=False)
-x = torch.empty((16, 1024), device='npu:0', dtype=torch.float16).bernoulli_(0.5)
-torch.npu.synchronize()
-print(f'shape={tuple(x.shape)} mean={x.float().mean().item():.4f} std={x.float().std().item():.4f}')
-"""),
-]
-
-
-def run_one(name, code):
-    print(f"\n=== {name} ===")
-    t0 = time.time()
-    r = subprocess.run(
-        [sys.executable, "-c", code],
-        capture_output=True, text=True, timeout=60,
-    )
-    elapsed = time.time() - t0
-    if r.returncode == 0:
-        print(f"  ✅ OK ({elapsed*1000:.1f}ms)")
-        for line in r.stdout.strip().splitlines():
-            print(f"  {line}")
-    else:
-        print(f"  ❌ FAILED ({elapsed*1000:.1f}ms, exit={r.returncode})")
-        for line in r.stderr.strip().splitlines()[-10:]:
-            print(f"  {line}")
-    return r.returncode == 0
 
 
 def main():
-    print("=" * 60)
-    print("empty + in-place random test (subprocess isolated)")
-    print("=" * 60)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--method",
+        choices=["normal", "uniform", "bernoulli"],
+        default="normal",
+        help="randn 平替方法（normal 是真平替）",
+    )
+    parser.add_argument("--shape", type=int, nargs="+", default=[16, 1024])
+    args = parser.parse_args()
 
-    results = {}
-    for name, code in METHODS:
-        results[name] = run_one(name, code)
+    shape = tuple(args.shape)
+    device = "npu:0"
+    dtype = torch.float16
 
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    for name, ok in results.items():
-        marker = "✅" if ok else "❌"
-        print(f"  {marker} {name}")
+    print(f"method={args.method}, shape={shape}, device={device}, dtype={dtype}")
+
+    t0 = time.time()
+    x = torch.empty(shape, device=device, dtype=dtype)
+    if args.method == "normal":
+        x.normal_()
+    elif args.method == "uniform":
+        x.uniform_(-1, 1)
+    elif args.method == "bernoulli":
+        x.bernoulli_(0.5)
+    torch.npu.synchronize()
+    elapsed = time.time() - t0
+
+    print(f"✅ OK ({elapsed*1000:.1f}ms)")
+    print(f"   shape={tuple(x.shape)}")
+    print(f"   mean={x.float().mean().item():.4f}")
+    print(f"   std ={x.float().std().item():.4f}")
+    print(f"   min ={x.float().min().item():.4f}")
+    print(f"   max ={x.float().max().item():.4f}")
 
 
 if __name__ == "__main__":
