@@ -5,6 +5,9 @@
 - 子进程访问时 NPU 内存不翻倍（验证真共享，不是 copy）
 - 子进程能用共享权重做计算
 - 子进程退出后父进程权重仍可用
+
+注意: RC 设备(310P1)上 torch.randn(..., device='npu') 走 aicpu 会报错，
+      所以先在 CPU 生成再 .to(npu)，跟主推理代码里的修复一致。
 """
 import os
 import time
@@ -24,7 +27,8 @@ def worker(weight, label):
 
     # 关键验证：内存不翻倍
     mem_before = torch.npu.memory_allocated() / 1e9
-    x = torch.randn(8, weight.shape[1], device=weight.device, dtype=weight.dtype)
+    # RC 上 randn 走 CPU→device
+    x = torch.randn(8, weight.shape[1], dtype=weight.dtype).to(weight.device)
     y = x @ weight.T
     torch.npu.synchronize()
     mem_after = torch.npu.memory_allocated() / 1e9
@@ -36,8 +40,8 @@ def main():
     device = "npu:0"
     print(f"[parent {os.getpid()}] allocating weight on {device}...")
     t0 = time.time()
-    # 模拟模型权重大小（约 32MB，够测 IPC，不浪费 NPU 内存）
-    weight = torch.randn(4096, 4096, device=device, dtype=torch.float16)
+    # RC 上 randn 走 CPU→device（跟 gr00t_n1d7.py 里的修复一致）
+    weight = torch.randn(4096, 4096, dtype=torch.float16).to(device)
     print(f"[parent] allocated in {time.time()-t0:.3f}s, "
           f"npu mem: {torch.npu.memory_allocated()/1e9:.3f}GB")
 
