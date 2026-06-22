@@ -818,17 +818,20 @@ def _orchestrate_per_traj(args: ArgsConfig):
                 os.remove(f)
 
         # Inherit argv but override traj-ids to single
+        # --traj-ids is multi-value (--traj-ids 0 1 2), so skip until next --flag
         sub_argv = []
-        skip_next = False
+        skip_traj_ids = False
         for a in sys.argv[1:]:
-            if skip_next:
-                skip_next = False
-                continue
             if a == "--traj-ids":
-                skip_next = True
+                skip_traj_ids = True
                 continue
             if a.startswith("--traj-ids="):
                 continue
+            if skip_traj_ids:
+                if a.startswith("-"):
+                    skip_traj_ids = False  # next flag, stop skipping
+                else:
+                    continue  # still in traj-ids values
             sub_argv.append(a)
         sub_argv += ["--traj-ids", str(traj_id)]
 
