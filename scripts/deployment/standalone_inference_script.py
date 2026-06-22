@@ -842,21 +842,44 @@ def _orchestrate_per_traj(args: ArgsConfig):
 
         print(f"\n[per-traj] spawning subprocess for trajectory {traj_id}")
         t0 = _time.time()
-        # Let subprocess run to completion naturally (no kill).
-        # If subprocess hangs at NPU cleanup, user Ctrl+C manually.
-        # Print dots while waiting so user sees it's not stuck.
+        # Two-phase timeout:
+        #   1. max_inference_wait: total for model load + compile + all steps
+        #   2. post_stats_timeout: after stats saved, how long to wait for clean
+        #      exit before killing (NPU cleanup may hang on RC)
         proc = sp.Popen([sys.executable] + sys.argv[:1] + sub_argv, env=env)
-        max_wait = 1800  # 30 min hard cap
+        max_inference_wait = 600   # 10 min for compile + full trajectory
+        post_stats_timeout = 120   # 2 min after stats file appears
+
+        stats_seen_time = None
         while True:
             if proc.poll() is not None:
                 break
-            if _time.time() - t0 > max_wait:
-                print(f"\n[per-traj] TIMEOUT after {max_wait}s, killing")
+
+            # Stats file appeared → inference done, start post-exit countdown
+            if stats_seen_time is None and os.path.exists(out_stats):
+                stats_seen_time = _time.time()
+                print(f"[per-traj] stats saved, waiting up to {post_stats_timeout}s "
+                      f"for subprocess clean exit")
+
+            # Phase 2: post-stats timeout
+            if stats_seen_time is not None:
+                since_stats = _time.time() - stats_seen_time
+                if since_stats > post_stats_timeout:
+                    print(f"[per-traj] didn't exit within {post_stats_timeout}s "
+                          f"after stats (NPU cleanup hung), killing")
+                    proc.kill()
+                    proc.wait(timeout=30)
+                    break
+
+            # Phase 1: total inference timeout
+            if _time.time() - t0 > max_inference_wait:
+                print(f"[per-traj] TOTAL TIMEOUT after {max_inference_wait}s, killing")
                 proc.kill()
                 proc.wait(timeout=30)
                 break
+
             _time.sleep(5)
-        # Subprocess exited on its own
+
         rc = proc.returncode
         elapsed = _time.time() - t0
         print(f"[per-traj] trajectory {traj_id} elapsed {elapsed:.1f}s"
