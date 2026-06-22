@@ -789,20 +789,165 @@ def _orchestrate_subprocess(args: ArgsConfig):
     return [], None
 
 
+def _orchestrate_per_traj(args: ArgsConfig):
+    """One subprocess per trajectory. Worker runs full trajectory and saves
+    predictions (.npy) + stats (.json). Orchestrator aggregates stats across
+    all trajectories and prints summary.
+
+    Use case: compile mode reduces per-step event leak enough that single
+    trajectory fits, but events still accumulate across trajectories.
+    """
+    import json
+    import subprocess as sp
+    import sys
+    import time as _time
+
+    print("=" * 80)
+    print(f"[per-traj orchestrator] {len(args.traj_ids)} trajectories, "
+          f"one subprocess each")
+    print("=" * 80)
+
+    all_stats = []
+
+    for traj_id in args.traj_ids:
+        out_pred = f"/tmp/gr00t_pred_traj{traj_id}.npy"
+        out_stats = f"/tmp/gr00t_stats_traj{traj_id}.json"
+        # Clean leftovers from previous run
+        for f in (out_pred, out_stats):
+            if os.path.exists(f):
+                os.remove(f)
+
+        # Inherit argv but override traj-ids to single
+        sub_argv = []
+        skip_next = False
+        for a in sys.argv[1:]:
+            if skip_next:
+                skip_next = False
+                continue
+            if a == "--traj-ids":
+                skip_next = True
+                continue
+            if a.startswith("--traj-ids="):
+                continue
+            sub_argv.append(a)
+        sub_argv += ["--traj-ids", str(traj_id)]
+
+        env = os.environ.copy()
+        env["_GR00T_WORKER"] = "1"
+        env["_GR00T_OUT_FILE"] = out_pred
+        env["_GR00T_STATS_FILE"] = out_stats
+
+        print(f"\n[per-traj] spawning subprocess for trajectory {traj_id}")
+        t0 = _time.time()
+        proc = sp.Popen([sys.executable] + sys.argv[:1] + sub_argv, env=env)
+
+        # Wait for stats file (written last by worker) or process exit.
+        # Kill on stats file appear to skip NPU cleanup hang.
+        max_wait = 1800  # 30 min per trajectory
+        killed = False
+        while True:
+            if os.path.exists(out_stats):
+                print(f"[per-traj] stats saved, killing subprocess to skip cleanup")
+                proc.kill()
+                proc.wait(timeout=30)
+                killed = True
+                break
+            if proc.poll() is not None:
+                break
+            if _time.time() - t0 > max_wait:
+                print(f"[per-traj] TIMEOUT after {max_wait}s, killing")
+                proc.kill()
+                proc.wait(timeout=30)
+                break
+            _time.sleep(2)
+
+        elapsed = _time.time() - t0
+        print(f"[per-traj] trajectory {traj_id} elapsed {elapsed:.1f}s"
+              f"{' (killed after save)' if killed else ''}")
+
+        if os.path.exists(out_stats):
+            try:
+                with open(out_stats) as f:
+                    stats = json.load(f)
+                all_stats.append(stats)
+                print(f"[per-traj]   MSE={stats.get('mse')}, "
+                      f"MAE={stats.get('mae')}, "
+                      f"steps={len(stats.get('inference_times', []))}")
+                os.remove(out_stats)
+            except Exception as e:
+                print(f"[per-traj]   failed to read stats: {e}")
+        else:
+            print(f"[per-traj]   no stats produced (subprocess failed?)")
+
+    # Aggregate
+    print("\n" + "=" * 80)
+    print(f"[per-traj] ALL {len(all_stats)}/{len(args.traj_ids)} trajectories completed")
+    print("=" * 80)
+
+    if not all_stats:
+        return [], None
+
+    # Per-trajectory summary
+    print("\nPer-trajectory:")
+    print(f"  {'traj_id':<10} {'MSE':<12} {'MAE':<12} {'avg_step_s':<12} {'steps':<8}")
+    for s in all_stats:
+        inf = s.get("inference_times", [])
+        avg = sum(inf) / len(inf) if inf else 0
+        print(f"  {s.get('traj_id'):<10} {s.get('mse', 'N/A'):<12} "
+              f"{s.get('mae', 'N/A'):<12} {avg:<12.4f} {len(inf):<8}")
+
+    # Aggregate metrics
+    mses = [s["mse"] for s in all_stats if s.get("mse") is not None]
+    maes = [s["mae"] for s in all_stats if s.get("mae") is not None]
+    if mses:
+        print(f"\nAggregated metrics ({len(mses)} trajectories):")
+        print(f"  Avg MSE: {sum(mses)/len(mses):.6f}")
+        print(f"  Avg MAE: {sum(maes)/len(maes):.6f}")
+
+    # Aggregate timing across all trajectories' steps
+    all_inf = [t for s in all_stats for t in s.get("inference_times", [])]
+    if all_inf:
+        import numpy as np
+        # Drop first 2 (warmup/compile) and last 1 (end artifact) per traj
+        cleaned = []
+        for s in all_stats:
+            inf = s.get("inference_times", [])
+            if len(inf) > 3:
+                cleaned.extend(inf[2:-1])
+            elif len(inf) > 1:
+                cleaned.extend(inf[1:])
+            else:
+                cleaned.extend(inf)
+        print(f"\nTiming ({len(all_inf)} total steps, "
+              f"{len(cleaned)} after skipping warmup+last):")
+        if cleaned:
+            print(f"  Steady-state avg: {sum(cleaned)/len(cleaned):.4f}s/step")
+            print(f"  Min: {min(cleaned):.4f}s")
+            print(f"  Max: {max(cleaned):.4f}s")
+            print(f"  P90: {np.percentile(cleaned, 90):.4f}s")
+        print(f"  Raw avg (incl. compile/warmup): {sum(all_inf)/len(all_inf):.4f}s")
+
+    return [], None
+
+
 def main(args: ArgsConfig):
-    # Subprocess isolation is OPT-IN via _GR00T_FORCE_SUBPROCESS=1.
-    # RC devices no longer auto-enable it (was too aggressive — prevented
-    # single-process debugging and instrumentation).
+    # Subprocess isolation is OPT-IN via env vars:
+    #   _GR00T_PER_TRAJ=1         one subprocess per trajectory (compile mode)
+    #   _GR00T_FORCE_SUBPROCESS=1 step-batching subprocess (eager mode, ≤2 steps/batch)
     is_worker = os.environ.get("_GR00T_WORKER") == "1"
     force_subprocess = os.environ.get("_GR00T_FORCE_SUBPROCESS") == "1"
+    per_traj = os.environ.get("_GR00T_PER_TRAJ") == "1"
     if (
         not is_worker
-        and force_subprocess
         and args.device.startswith("npu")
         and not args.profile
     ):
-        print("[main] _GR00T_FORCE_SUBPROCESS=1, using subprocess isolation")
-        return _orchestrate_subprocess(args)
+        if per_traj and len(args.traj_ids) > 1:
+            print("[main] _GR00T_PER_TRAJ=1, one subprocess per trajectory")
+            return _orchestrate_per_traj(args)
+        if force_subprocess:
+            print("[main] _GR00T_FORCE_SUBPROCESS=1, using step-batching subprocess")
+            return _orchestrate_subprocess(args)
 
     # NPU initialization
     if args.device.startswith("npu"):
@@ -1087,9 +1232,25 @@ def main(args: ArgsConfig):
     # Worker mode: save predictions for orchestrator to pick up, then exit.
     if os.environ.get("_GR00T_WORKER") == "1":
         out_file = os.environ.get("_GR00T_OUT_FILE")
+        stats_file = os.environ.get("_GR00T_STATS_FILE")
         if out_file and pred_actions:
             np.save(out_file, pred_actions[-1])
-            logging.info(f"[worker] saved predictions to {out_file}")
+        if stats_file:
+            import json
+            # Worker only ran 1 trajectory (set by orchestrator), so take [-1]
+            timing = all_timings[-1] if all_timings else {}
+            stats = {
+                "traj_id": args.traj_ids[0] if args.traj_ids else None,
+                "mse": all_mse[-1] if all_mse else None,
+                "mae": all_mae[-1] if all_mae else None,
+                "inference_times": timing.get("inference_times", []),
+                "data_prep_times": timing.get("data_prep_times", []),
+                "episode_load_time": timing.get("episode_load_time", 0),
+            }
+            with open(stats_file, "w") as f:
+                json.dump(stats, f)
+            logging.info(f"[worker] saved predictions + stats "
+                         f"(MSE={stats['mse']}, steps={len(stats['inference_times'])})")
         return [], None
 
     logging.info("=" * 80)
