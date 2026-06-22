@@ -842,31 +842,25 @@ def _orchestrate_per_traj(args: ArgsConfig):
 
         print(f"\n[per-traj] spawning subprocess for trajectory {traj_id}")
         t0 = _time.time()
+        # Let subprocess run to completion naturally (no kill).
+        # If subprocess hangs at NPU cleanup, user Ctrl+C manually.
+        # Print dots while waiting so user sees it's not stuck.
         proc = sp.Popen([sys.executable] + sys.argv[:1] + sub_argv, env=env)
-
-        # Wait for stats file (written last by worker) or process exit.
-        # Kill on stats file appear to skip NPU cleanup hang.
-        max_wait = 1800  # 30 min per trajectory
-        killed = False
+        max_wait = 1800  # 30 min hard cap
         while True:
-            if os.path.exists(out_stats):
-                print(f"[per-traj] stats saved, killing subprocess to skip cleanup")
-                proc.kill()
-                proc.wait(timeout=30)
-                killed = True
-                break
             if proc.poll() is not None:
                 break
             if _time.time() - t0 > max_wait:
-                print(f"[per-traj] TIMEOUT after {max_wait}s, killing")
+                print(f"\n[per-traj] TIMEOUT after {max_wait}s, killing")
                 proc.kill()
                 proc.wait(timeout=30)
                 break
-            _time.sleep(2)
-
+            _time.sleep(5)
+        # Subprocess exited on its own
+        rc = proc.returncode
         elapsed = _time.time() - t0
         print(f"[per-traj] trajectory {traj_id} elapsed {elapsed:.1f}s"
-              f"{' (killed after save)' if killed else ''}")
+              f" (exit_code={rc})")
 
         if os.path.exists(out_stats):
             try:
@@ -892,12 +886,14 @@ def _orchestrate_per_traj(args: ArgsConfig):
 
     # Per-trajectory summary
     print("\nPer-trajectory:")
-    print(f"  {'traj_id':<10} {'MSE':<12} {'MAE':<12} {'avg_step_s':<12} {'steps':<8}")
+    print(f"  {'traj_id':<10} {'MSE':<14} {'MAE':<14} {'avg_step_s':<12} {'steps':<8}")
     for s in all_stats:
         inf = s.get("inference_times", [])
         avg = sum(inf) / len(inf) if inf else 0
-        print(f"  {s.get('traj_id'):<10} {s.get('mse', 'N/A'):<12} "
-              f"{s.get('mae', 'N/A'):<12} {avg:<12.4f} {len(inf):<8}")
+        mse_str = f"{s['mse']:.6f}" if s.get('mse') is not None else "N/A"
+        mae_str = f"{s['mae']:.6f}" if s.get('mae') is not None else "N/A"
+        traj_str = str(s.get('traj_id'))
+        print(f"  {traj_str:<10} {mse_str:<14} {mae_str:<14} {avg:<12.4f} {len(inf):<8}")
 
     # Aggregate metrics
     mses = [s["mse"] for s in all_stats if s.get("mse") is not None]
@@ -1132,13 +1128,14 @@ def main(args: ArgsConfig):
             step_start=args.step_start,
         )
         pred_actions.append(pred_action_across_time)
+        all_timings.append(timing_dict)  # always record timing (worker needs it for stats)
 
-        # In worker mode (subprocess isolation), pred only covers step_start..step_end,
-        # but evaluate_predictions expects full trajectory coverage → dimension mismatch.
-        # Skip evaluation here; orchestrator combines all batches later.
-        if is_worker:
+        # In step-batching worker mode (step_start > 0), pred is partial → eval
+        # dimension mismatch → skip. Per-traj worker (step_start = 0) and normal
+        # mode run evaluate_predictions normally.
+        if is_worker and args.step_start > 0:
             logging.info(f"[worker] ran {len(pred_action_across_time)} actions, "
-                         f"skipping evaluate_predictions (orchestrator will combine)")
+                         f"step_start={args.step_start} → skipping evaluate_predictions")
             continue
 
         if args.get_performance_stats:
@@ -1156,7 +1153,6 @@ def main(args: ArgsConfig):
             logging.info(f"MSE for trajectory {traj_id}: {mse}, MAE: {mae}")
             all_mse.append(mse)
             all_mae.append(mae)
-            all_timings.append(timing_dict)
 
     if args.get_performance_stats:
         # Final performance summary
