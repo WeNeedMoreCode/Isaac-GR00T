@@ -898,10 +898,18 @@ def _orchestrate_per_traj(args: ArgsConfig):
     # Aggregate metrics
     mses = [s["mse"] for s in all_stats if s.get("mse") is not None]
     maes = [s["mae"] for s in all_stats if s.get("mae") is not None]
+    skipped = len(all_stats) - len(mses)
     if mses:
-        print(f"\nAggregated metrics ({len(mses)} trajectories):")
+        print(f"\nAggregated metrics ({len(mses)} trajectories"
+              f"{f', {skipped} skipped due to None MSE' if skipped else ''}):")
         print(f"  Avg MSE: {sum(mses)/len(mses):.6f}")
         print(f"  Avg MAE: {sum(maes)/len(maes):.6f}")
+        if skipped:
+            print(f"  ⚠️  {skipped} trajectory has missing MSE — check worker logs")
+            for s in all_stats:
+                if s.get("mse") is None:
+                    print(f"     traj_id={s.get('traj_id')} has MSE=None, "
+                          f"steps={len(s.get('inference_times', []))}")
 
     # Aggregate timing across all trajectories' steps
     all_inf = [t for s in all_stats for t in s.get("inference_times", [])]
@@ -1154,7 +1162,9 @@ def main(args: ArgsConfig):
             all_mse.append(mse)
             all_mae.append(mae)
 
-    if args.get_performance_stats:
+    # Worker mode: skip summary (orchestrator prints aggregated summary at end).
+    # Worker only saves stats file and exits.
+    if args.get_performance_stats and not is_worker:
         # Final performance summary
         logging.info("\n" + "=" * 80)
         logging.info("=== EVALUATION SUMMARY ===")
