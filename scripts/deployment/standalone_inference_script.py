@@ -855,6 +855,9 @@ def _orchestrate_per_traj(args: ArgsConfig):
     Use case: compile mode reduces per-step event leak enough that single
     trajectory fits, but events still accumulate across trajectories.
     """
+    # Orchestrator returns before main() calls basicConfig, so logging.info
+    # in _print_summary would be silently dropped. Configure here.
+    logging.basicConfig(level=logging.INFO)
     import json
     import subprocess as sp
     import sys
@@ -905,7 +908,7 @@ def _orchestrate_per_traj(args: ArgsConfig):
         #   2. post_stats_timeout: after stats saved, how long to wait for clean
         #      exit before killing (NPU cleanup may hang on RC)
         proc = sp.Popen([sys.executable] + sys.argv[:1] + sub_argv, env=env)
-        post_stats_timeout = 120   # after stats saved, 2 min to exit cleanly
+        post_stats_timeout = 60    # after stats saved, 1 min to exit cleanly
 
         stats_seen_time = None
         while True:
