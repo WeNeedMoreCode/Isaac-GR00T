@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import os
 from typing import Any, Tuple
 
 import torch
@@ -45,6 +46,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
+        self._cached_noise = None  # for _GR00T_CACHE_RANDN optimization
 
         if config.use_alternate_vl_dit:
             self.model = AlternateVLDiT(
@@ -334,18 +336,29 @@ class Gr00tN1d7ActionHead(nn.Module):
         device = vl_embeds.device
         # RC device: StatelessRandomNormalV2 runs on aicpu and may fail,
         # generate on CPU then move to device.
+        # _GR00T_CACHE_RANDN=1: first call generates + caches on NPU, subsequent
+        # calls clone the cached tensor (avoids repeated CPU gen + H2D copy).
         try:
             from npu_utils import _is_rc_device
             _rc = _is_rc_device()
         except ImportError:
             _rc = False
-        actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.action_dim),
-            dtype=vl_embeds.dtype,
-            device="cpu" if _rc else device,
-        )
-        if _rc:
-            actions = actions.to(device)
+
+        noise_shape = (batch_size, self.config.action_horizon, self.action_dim)
+        _cache_randn = os.environ.get("_GR00T_CACHE_RANDN") == "1"
+
+        if _cache_randn and self._cached_noise is not None:
+            actions = self._cached_noise.clone()
+        else:
+            actions = torch.randn(
+                size=noise_shape,
+                dtype=vl_embeds.dtype,
+                device="cpu" if _rc else device,
+            )
+            if _rc:
+                actions = actions.to(device)
+            if _cache_randn:
+                self._cached_noise = actions.clone()
 
         dt = 1.0 / self.num_inference_timesteps
         vel_strength = torch.ones_like(actions)

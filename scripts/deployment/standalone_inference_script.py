@@ -789,6 +789,64 @@ def _orchestrate_subprocess(args: ArgsConfig):
     return [], None
 
 
+def _print_summary(all_mse, all_mae, all_timings, model_load_time, dataset_load_time):
+    """Print evaluation + timing summary. Called by both main() and per-traj orchestrator."""
+    logging.info("\n" + "=" * 80)
+    logging.info("=== EVALUATION SUMMARY ===")
+    logging.info("=" * 80)
+
+    if all_mse:
+        avg_mse = np.mean(np.array(all_mse))
+        avg_mae = np.mean(np.array(all_mae))
+        logging.info("\nMetrics:")
+        logging.info(f"  Average MSE across all trajs: {avg_mse:.6f}")
+        logging.info(f"  Average MAE across all trajs: {avg_mae:.6f}")
+    else:
+        logging.info("No valid trajectories were evaluated.")
+
+    logging.info("\n" + "=" * 80)
+    logging.info("=== DETAILED TIMING SUMMARY ===")
+    logging.info("=" * 80)
+    logging.info("\nInitialization:")
+    logging.info(f"  Model loading time:          {model_load_time:.4f}s")
+    logging.info(f"  Dataset loader creation:     {dataset_load_time:.4f}s")
+
+    if all_timings:
+        total_episode_load = sum(t["episode_load_time"] for t in all_timings)
+        total_data_prep = sum(sum(t["data_prep_times"]) for t in all_timings)
+        total_inference = sum(sum(t["inference_times"]) for t in all_timings)
+        total_inference_steps = sum(len(t["inference_times"]) for t in all_timings)
+
+        logging.info(f"\nPer-Trajectory Timings ({len(all_timings)} trajectories):")
+        logging.info(
+            f"  Total episode loading:       {total_episode_load:.4f}s  "
+            f"(avg: {total_episode_load / len(all_timings):.4f}s)"
+        )
+        if total_inference_steps > 0:
+            logging.info(
+                f"  Total data preparation:      {total_data_prep:.4f}s  "
+                f"(avg: {total_data_prep / total_inference_steps:.4f}s per step)"
+            )
+            logging.info(
+                f"  Total inference:             {total_inference:.4f}s  "
+                f"(avg: {total_inference / total_inference_steps:.4f}s per step)"
+            )
+        else:
+            logging.info(f"  Total data preparation:      {total_data_prep:.4f}s  (no timed steps)")
+            logging.info(f"  Total inference:             {total_inference:.4f}s  (no timed steps)")
+
+        logging.info("\nInference Statistics:")
+        logging.info(f"  Total inference steps:       {total_inference_steps}")
+        if total_inference_steps > 0:
+            logging.info(
+                f"  Avg inference time per step: {total_inference / total_inference_steps:.4f}s"
+            )
+            all_inf_times = [t for timing in all_timings for t in timing["inference_times"]]
+            logging.info(f"  Min inference time:          {min(all_inf_times):.4f}s")
+            logging.info(f"  Max inference time:          {max(all_inf_times):.4f}s")
+            logging.info(f"  P90 inference time:          {np.percentile(all_inf_times, 90):.4f}s")
+
+
 def _orchestrate_per_traj(args: ArgsConfig):
     """One subprocess per trajectory. Worker runs full trajectory and saves
     predictions (.npy) + stats (.json). Orchestrator aggregates stats across
@@ -847,21 +905,21 @@ def _orchestrate_per_traj(args: ArgsConfig):
         #   2. post_stats_timeout: after stats saved, how long to wait for clean
         #      exit before killing (NPU cleanup may hang on RC)
         proc = sp.Popen([sys.executable] + sys.argv[:1] + sub_argv, env=env)
-        max_inference_wait = 600   # 10 min for compile + full trajectory
-        post_stats_timeout = 120   # 2 min after stats file appears
+        post_stats_timeout = 120   # after stats saved, 2 min to exit cleanly
 
         stats_seen_time = None
         while True:
             if proc.poll() is not None:
                 break
 
-            # Stats file appeared → inference done, start post-exit countdown
+            # Detect stats file appearance (inference done, worker saving results)
             if stats_seen_time is None and os.path.exists(out_stats):
                 stats_seen_time = _time.time()
                 print(f"[per-traj] stats saved, waiting up to {post_stats_timeout}s "
                       f"for subprocess clean exit")
 
-            # Phase 2: post-stats timeout
+            # After stats appear: if subprocess doesn't exit within timeout,
+            # it's stuck on NPU cleanup → kill to unblock next trajectory.
             if stats_seen_time is not None:
                 since_stats = _time.time() - stats_seen_time
                 if since_stats > post_stats_timeout:
@@ -870,13 +928,6 @@ def _orchestrate_per_traj(args: ArgsConfig):
                     proc.kill()
                     proc.wait(timeout=30)
                     break
-
-            # Phase 1: total inference timeout
-            if _time.time() - t0 > max_inference_wait:
-                print(f"[per-traj] TOTAL TIMEOUT after {max_inference_wait}s, killing")
-                proc.kill()
-                proc.wait(timeout=30)
-                break
 
             _time.sleep(5)
 
@@ -907,8 +958,25 @@ def _orchestrate_per_traj(args: ArgsConfig):
     if not all_stats:
         return [], None
 
-    # Per-trajectory summary
-    print("\nPer-trajectory:")
+    # Reconstruct all_mse / all_mae / all_timings from collected stats, then call
+    # the SAME summary function used by single-process main(). Output format is
+    # identical so RC vs DUO runs can be diffed directly.
+    all_mse = [s["mse"] for s in all_stats if s.get("mse") is not None]
+    all_mae = [s["mae"] for s in all_stats if s.get("mae") is not None]
+    all_timings_reconstructed = [
+        {
+            "episode_load_time": s.get("episode_load_time", 0),
+            "data_prep_times": s.get("data_prep_times", []),
+            "inference_times": s.get("inference_times", []),
+        }
+        for s in all_stats
+    ]
+    # model_load_time / dataset_load_time not tracked per subprocess in orchestrator;
+    # set to 0 (workers' individual load times are in their own logs).
+    _print_summary(all_mse, all_mae, all_timings_reconstructed, 0.0, 0.0)
+
+    # Per-trajectory quick-look table (in addition to the standard summary above)
+    print("\nPer-trajectory (quick look):")
     print(f"  {'traj_id':<10} {'MSE':<14} {'MAE':<14} {'avg_step_s':<12} {'steps':<8}")
     for s in all_stats:
         inf = s.get("inference_times", [])
@@ -917,45 +985,6 @@ def _orchestrate_per_traj(args: ArgsConfig):
         mae_str = f"{s['mae']:.6f}" if s.get('mae') is not None else "N/A"
         traj_str = str(s.get('traj_id'))
         print(f"  {traj_str:<10} {mse_str:<14} {mae_str:<14} {avg:<12.4f} {len(inf):<8}")
-
-    # Aggregate metrics
-    mses = [s["mse"] for s in all_stats if s.get("mse") is not None]
-    maes = [s["mae"] for s in all_stats if s.get("mae") is not None]
-    skipped = len(all_stats) - len(mses)
-    if mses:
-        print(f"\nAggregated metrics ({len(mses)} trajectories"
-              f"{f', {skipped} skipped due to None MSE' if skipped else ''}):")
-        print(f"  Avg MSE: {sum(mses)/len(mses):.6f}")
-        print(f"  Avg MAE: {sum(maes)/len(maes):.6f}")
-        if skipped:
-            print(f"  ⚠️  {skipped} trajectory has missing MSE — check worker logs")
-            for s in all_stats:
-                if s.get("mse") is None:
-                    print(f"     traj_id={s.get('traj_id')} has MSE=None, "
-                          f"steps={len(s.get('inference_times', []))}")
-
-    # Aggregate timing across all trajectories' steps
-    all_inf = [t for s in all_stats for t in s.get("inference_times", [])]
-    if all_inf:
-        import numpy as np
-        # Drop first 2 (warmup/compile) and last 1 (end artifact) per traj
-        cleaned = []
-        for s in all_stats:
-            inf = s.get("inference_times", [])
-            if len(inf) > 3:
-                cleaned.extend(inf[2:-1])
-            elif len(inf) > 1:
-                cleaned.extend(inf[1:])
-            else:
-                cleaned.extend(inf)
-        print(f"\nTiming ({len(all_inf)} total steps, "
-              f"{len(cleaned)} after skipping warmup+last):")
-        if cleaned:
-            print(f"  Steady-state avg: {sum(cleaned)/len(cleaned):.4f}s/step")
-            print(f"  Min: {min(cleaned):.4f}s")
-            print(f"  Max: {max(cleaned):.4f}s")
-            print(f"  P90: {np.percentile(cleaned, 90):.4f}s")
-        print(f"  Raw avg (incl. compile/warmup): {sum(all_inf)/len(all_inf):.4f}s")
 
     return [], None
 
@@ -1188,68 +1217,7 @@ def main(args: ArgsConfig):
     # Worker mode: skip summary (orchestrator prints aggregated summary at end).
     # Worker only saves stats file and exits.
     if args.get_performance_stats and not is_worker:
-        # Final performance summary
-        logging.info("\n" + "=" * 80)
-        logging.info("=== EVALUATION SUMMARY ===")
-        logging.info("=" * 80)
-
-        if all_mse:
-            avg_mse = np.mean(np.array(all_mse))
-            avg_mae = np.mean(np.array(all_mae))
-            logging.info("\nMetrics:")
-            logging.info(f"  Average MSE across all trajs: {avg_mse:.6f}")
-            logging.info(f"  Average MAE across all trajs: {avg_mae:.6f}")
-        else:
-            logging.info("No valid trajectories were evaluated.")
-
-        # Detailed timing summary
-        logging.info("\n" + "=" * 80)
-        logging.info("=== DETAILED TIMING SUMMARY ===")
-        logging.info("=" * 80)
-        logging.info("\nInitialization:")
-        logging.info(f"  Model loading time:          {model_load_time:.4f}s")
-        logging.info(f"  Dataset loader creation:     {dataset_load_time:.4f}s")
-
-        if all_timings:
-            # Aggregate timing statistics
-            total_episode_load = sum(t["episode_load_time"] for t in all_timings)
-            total_data_prep = sum(sum(t["data_prep_times"]) for t in all_timings)
-            total_inference = sum(sum(t["inference_times"]) for t in all_timings)
-
-            # Count total inference steps
-            total_inference_steps = sum(len(t["inference_times"]) for t in all_timings)
-
-            logging.info(f"\nPer-Trajectory Timings ({len(all_timings)} trajectories):")
-            logging.info(
-                f"  Total episode loading:       {total_episode_load:.4f}s  (avg: {total_episode_load / len(all_timings):.4f}s)"
-            )
-            if total_inference_steps > 0:
-                logging.info(
-                    f"  Total data preparation:      {total_data_prep:.4f}s  (avg: {total_data_prep / total_inference_steps:.4f}s per step)"
-                )
-                logging.info(
-                    f"  Total inference:             {total_inference:.4f}s  (avg: {total_inference / total_inference_steps:.4f}s per step)"
-                )
-            else:
-                logging.info(
-                    f"  Total data preparation:      {total_data_prep:.4f}s  (no timed steps)"
-                )
-                logging.info(
-                    f"  Total inference:             {total_inference:.4f}s  (no timed steps)"
-                )
-
-            logging.info("\nInference Statistics:")
-            logging.info(f"  Total inference steps:       {total_inference_steps}")
-            if total_inference_steps > 0:
-                logging.info(
-                    f"  Avg inference time per step: {total_inference / total_inference_steps:.4f}s"
-                )
-                all_inf_times = [t for timing in all_timings for t in timing["inference_times"]]
-                logging.info(f"  Min inference time:          {min(all_inf_times):.4f}s")
-                logging.info(f"  Max inference time:          {max(all_inf_times):.4f}s")
-                logging.info(
-                    f"  P90 inference time:          {np.percentile(all_inf_times, 90):.4f}s"
-                )
+        _print_summary(all_mse, all_mae, all_timings, model_load_time, dataset_load_time)
 
     if len(pred_actions) == 0:
         raise ValueError(
