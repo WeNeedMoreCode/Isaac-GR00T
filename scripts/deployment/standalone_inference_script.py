@@ -660,8 +660,8 @@ class ArgsConfig:
     save_plot_path: str | None = None
     """Path to save the plot to."""
 
-    skip_timing_steps: int = 1
-    """Number of initial inference steps to skip when calculating timing statistics (default: 1 to exclude warmup)."""
+    skip_timing_steps: int = 2
+    """Number of initial inference steps to skip when calculating timing statistics (default: 2 to exclude compile + lazy-compile spillover)."""
 
     no_pipeline: bool = False
     """Disable CPU/NPU pipeline overlap (useful for debugging memory on shared-memory devices)."""
