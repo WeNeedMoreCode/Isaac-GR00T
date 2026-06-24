@@ -370,9 +370,6 @@ class Qwen3Backbone(torch.nn.Module):
         visual = self.model.model.visual
 
         # Conv3D strategy (priority: env var > script flag > RC auto-detect):
-        #   _GR00T_NATIVE_CONV3D=1  → force native Conv3D
-        #   --conv3d-replace        → force reshape+matmul replacement
-        #   default                 → RC uses replacement, DUO uses native
         if getattr(self, '_use_conv3d_replacement', None) is None:
             if os.environ.get("_GR00T_NATIVE_CONV3D") == "1":
                 self._use_conv3d_replacement = False
@@ -385,32 +382,10 @@ class Qwen3Backbone(torch.nn.Module):
                 except ImportError:
                     self._use_conv3d_replacement = False
 
-        _prof = getattr(self, '_enable_profiling', False)
-        _sync = getattr(self, '_profile_sync', False) and _prof
-
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t0 = time.time()
-        _prof = getattr(self, '_enable_profiling', False)
-        _sync = getattr(self, '_profile_sync', False) and _prof
-
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t0 = time.time()
         if self._use_conv3d_replacement:
             hidden_states = self._conv3d_as_linear(pixel_values, visual.patch_embed.proj)
         else:
             hidden_states = visual.patch_embed(pixel_values)
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t_conv3d = time.time() - t0
-            mode = "reshape+matmul" if self._use_conv3d_replacement else "native"
-            print(f"[PROF] conv3d ({mode}): {t_conv3d*1000:.1f}ms")
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t_conv3d = time.time() - t0
-            mode = "reshape+matmul" if self._use_conv3d_replacement else "native"
-            print(f"[PROF] conv3d ({mode}): {t_conv3d*1000:.1f}ms")
 
         hidden_states = hidden_states + self._cached_visual_pos_embeds.to(
             hidden_states.device, hidden_states.dtype
