@@ -940,18 +940,10 @@ def _orchestrate_per_traj(args: ArgsConfig):
               f" (exit_code={rc})")
 
         if os.path.exists(out_stats):
-            try:
-                with open(out_stats) as f:
-                    stats = json.load(f)
-                all_stats.append(stats)
-                print(f"[per-traj]   MSE={stats.get('mse')}, "
-                      f"MAE={stats.get('mae')}, "
-                      f"steps={len(stats.get('inference_times', []))}")
-                os.remove(out_stats)
-            except Exception as e:
-                print(f"[per-traj]   failed to read stats: {e}")
-        else:
-            print(f"[per-traj]   no stats produced (subprocess failed?)")
+            with open(out_stats) as f:
+                stats = json.load(f)
+            all_stats.append(stats)
+            os.remove(out_stats)
 
     # Aggregate
     print("\n" + "=" * 80)
@@ -977,17 +969,6 @@ def _orchestrate_per_traj(args: ArgsConfig):
     # model_load_time / dataset_load_time not tracked per subprocess in orchestrator;
     # set to 0 (workers' individual load times are in their own logs).
     _print_summary(all_mse, all_mae, all_timings_reconstructed, 0.0, 0.0)
-
-    # Per-trajectory quick-look table (in addition to the standard summary above)
-    print("\nPer-trajectory (quick look):")
-    print(f"  {'traj_id':<10} {'MSE':<14} {'MAE':<14} {'avg_step_s':<12} {'steps':<8}")
-    for s in all_stats:
-        inf = s.get("inference_times", [])
-        avg = sum(inf) / len(inf) if inf else 0
-        mse_str = f"{s['mse']:.6f}" if s.get('mse') is not None else "N/A"
-        mae_str = f"{s['mae']:.6f}" if s.get('mae') is not None else "N/A"
-        traj_str = str(s.get('traj_id'))
-        print(f"  {traj_str:<10} {mse_str:<14} {mae_str:<14} {avg:<12.4f} {len(inf):<8}")
 
     return [], None
 

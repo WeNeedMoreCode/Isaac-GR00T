@@ -367,13 +367,8 @@ class Qwen3Backbone(torch.nn.Module):
         """
         visual = self.model.model.visual
 
-        # RC device: Conv3D lacks precompiled kernel, use reshape + matmul replacement
-        if getattr(self, '_use_conv3d_replacement', None) is None:
-            try:
-                from npu_utils import _is_rc_device
-                self._use_conv3d_replacement = _is_rc_device()
-            except ImportError:
-                self._use_conv3d_replacement = False
+        # TEMP TEST: force native Conv3D to check if CANN 25.5.t8 supports it now
+        self._use_conv3d_replacement = False
 
         if self._use_conv3d_replacement:
             hidden_states = self._conv3d_as_linear(pixel_values, visual.patch_embed.proj)
