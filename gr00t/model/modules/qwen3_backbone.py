@@ -388,16 +388,27 @@ class Qwen3Backbone(torch.nn.Module):
         _prof = getattr(self, '_enable_profiling', False)
         _sync = getattr(self, '_profile_sync', False) and _prof
 
-        if _sync: torch.npu.synchronize()
-        t0 = time.time()
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t0 = time.time()
+        _prof = getattr(self, '_enable_profiling', False)
+        _sync = getattr(self, '_profile_sync', False) and _prof
+
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t0 = time.time()
         if self._use_conv3d_replacement:
             hidden_states = self._conv3d_as_linear(pixel_values, visual.patch_embed.proj)
         else:
             hidden_states = visual.patch_embed(pixel_values)
-        if _sync: torch.npu.synchronize()
-        t_conv3d = time.time() - t0
-
         if _prof:
+            if _sync: torch.npu.synchronize()
+            t_conv3d = time.time() - t0
+            mode = "reshape+matmul" if self._use_conv3d_replacement else "native"
+            print(f"[PROF] conv3d ({mode}): {t_conv3d*1000:.1f}ms")
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t_conv3d = time.time() - t0
             mode = "reshape+matmul" if self._use_conv3d_replacement else "native"
             print(f"[PROF] conv3d ({mode}): {t_conv3d*1000:.1f}ms")
 
@@ -532,8 +543,9 @@ class Qwen3Backbone(torch.nn.Module):
         vl_input["image_mask"] = image_mask
 
         # Step 1b: Position IDs (get_rope_index uses .tolist(), not compilable)
-        if _sync: torch.npu.synchronize()
-        t0 = time.time()
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t0 = time.time()
         qwen3vl_model = self.model.model
         position_ids, _ = qwen3vl_model.get_rope_index(
             vl_input["input_ids"],
@@ -549,22 +561,27 @@ class Qwen3Backbone(torch.nn.Module):
             text_position_ids = position_ids[0]
         vl_input["position_ids"] = position_ids
         vl_input["text_position_ids"] = text_position_ids
-        if _sync: torch.npu.synchronize()
-        t_rope = time.time() - t0
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t_rope = time.time() - t0
 
         # Step 2: Preprocess (compilable with torchair)
-        if _sync: torch.npu.synchronize()
-        t0 = time.time()
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t0 = time.time()
         lm_kwargs = self._preprocess_vl_input(vl_input)
-        if _sync: torch.npu.synchronize()
-        t_preprocess = time.time() - t0
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t_preprocess = time.time() - t0
 
         # Step 3: Language model (compilable with torchair)
-        if _sync: torch.npu.synchronize()
-        t0 = time.time()
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t0 = time.time()
         hidden_states = self._language_model_forward(**lm_kwargs)
-        if _sync: torch.npu.synchronize()
-        t_lm = time.time() - t0
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t_lm = time.time() - t0
 
         # Step 4: Output processing
         attention_mask = vl_input["attention_mask"] == 1

@@ -617,27 +617,30 @@ class Gr00tN1d7(PreTrainedModel):
         _prof = getattr(self, '_enable_profiling', False)
         _sync = getattr(self, '_profile_sync', False) and _prof
 
-        # Prepare inputs for backbone and action head
-        if _sync: torch.npu.synchronize()
-        t0 = time.time()
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t0 = time.time()
         backbone_inputs, action_inputs = self.prepare_input(inputs)
-        if _sync: torch.npu.synchronize()
-        t_prepare = time.time() - t0
-
-        # Forward through backbone
-        if _sync: torch.npu.synchronize()
-        t0 = time.time()
-        backbone_outputs = self.backbone(backbone_inputs)
-        if _sync: torch.npu.synchronize()
-        t_backbone = time.time() - t0
-
-        if _sync: torch.npu.synchronize()
-        t0 = time.time()
-        action_outputs = self.action_head.get_action(backbone_outputs, action_inputs, options)
-        if _sync: torch.npu.synchronize()
-        t_action = time.time() - t0
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t_prepare = time.time() - t0
 
         if _prof:
+            if _sync: torch.npu.synchronize()
+            t0 = time.time()
+        backbone_outputs = self.backbone(backbone_inputs)
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t_backbone = time.time() - t0
+
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t0 = time.time()
+        action_outputs = self.action_head.get_action(backbone_outputs, action_inputs, options)
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t_action = time.time() - t0
+
             self._prof_step = getattr(self, '_prof_step', 0) + 1
             if self._prof_step <= 4:
                 print(f"[PROF] model: prepare={t_prepare*1000:.1f}ms  "
