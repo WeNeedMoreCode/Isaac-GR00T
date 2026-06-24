@@ -678,6 +678,9 @@ class ArgsConfig:
     profile: bool = False
     """Enable torch_npu.profiler profiling (results saved to ./prof_result)."""
 
+    instrument: bool = False
+    """Enable per-step instrumentation: backbone/action_head timing breakdown with NPU sync."""
+
     seed: int = 42
     """Seed to use for reproducibility."""
 
@@ -1059,6 +1062,12 @@ def main(args: ArgsConfig):
         policy.model.action_head.num_inference_timesteps = args.denoising_steps
         logging.info(f"Denoising steps overridden to: {args.denoising_steps}")
     logging.info(f"Actual num_inference_timesteps: {policy.model.action_head.num_inference_timesteps}")
+
+    if args.instrument:
+        policy.model._enable_profiling = True
+        policy.model.backbone._enable_profiling = True
+        policy.model._profile_sync = True
+        logging.info("Instrumentation enabled (with NPU sync for accurate timing)")
 
     # Apply inference mode
     if args.inference_mode == "trt_full_pipeline":

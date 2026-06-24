@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import logging
+import os
+import time
 
 import torch
 import torch.nn as nn
@@ -497,6 +499,9 @@ class Qwen3Backbone(torch.nn.Module):
         return hidden_states
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
+        _prof = getattr(self, '_enable_profiling', False)
+        _sync = getattr(self, '_profile_sync', False) and _prof
+
         self.set_frozen_modules_to_eval_mode()
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
@@ -511,6 +516,8 @@ class Qwen3Backbone(torch.nn.Module):
         vl_input["image_mask"] = image_mask
 
         # Step 1b: Position IDs (get_rope_index uses .tolist(), not compilable)
+        if _sync: torch.npu.synchronize()
+        t0 = time.time()
         qwen3vl_model = self.model.model
         position_ids, _ = qwen3vl_model.get_rope_index(
             vl_input["input_ids"],
@@ -526,15 +533,32 @@ class Qwen3Backbone(torch.nn.Module):
             text_position_ids = position_ids[0]
         vl_input["position_ids"] = position_ids
         vl_input["text_position_ids"] = text_position_ids
+        if _sync: torch.npu.synchronize()
+        t_rope = time.time() - t0
 
         # Step 2: Preprocess (compilable with torchair)
+        if _sync: torch.npu.synchronize()
+        t0 = time.time()
         lm_kwargs = self._preprocess_vl_input(vl_input)
+        if _sync: torch.npu.synchronize()
+        t_preprocess = time.time() - t0
 
         # Step 3: Language model (compilable with torchair)
+        if _sync: torch.npu.synchronize()
+        t0 = time.time()
         hidden_states = self._language_model_forward(**lm_kwargs)
+        if _sync: torch.npu.synchronize()
+        t_lm = time.time() - t0
 
         # Step 4: Output processing
         attention_mask = vl_input["attention_mask"] == 1
+
+        if _prof:
+            self._prof_step = getattr(self, '_prof_step', 0) + 1
+            if self._prof_step <= 4:
+                print(f"[PROF] backbone: rope_idx={t_rope*1000:.1f}ms  "
+                      f"preprocess={t_preprocess*1000:.1f}ms  lm={t_lm*1000:.1f}ms  "
+                      f"total={((t_rope+t_preprocess+t_lm)*1000):.1f}ms")
 
         return BatchFeature(
             data={
