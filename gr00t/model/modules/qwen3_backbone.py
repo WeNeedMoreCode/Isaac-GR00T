@@ -225,7 +225,7 @@ class Qwen3Backbone(torch.nn.Module):
             return
 
         # Apply FFN split4 AFTER model is on NPU (weights already format-converted)
-        if not self._ffn_split4_done:
+        if not self._ffn_split4_done and not getattr(self, '_skip_ffn_split4', False):
             self._apply_ffn_split4()
             self._ffn_split4_done = True
 
@@ -369,11 +369,15 @@ class Qwen3Backbone(torch.nn.Module):
         """
         visual = self.model.model.visual
 
-        # Conv3D strategy: RC defaults to reshape+matmul replacement (no binary in OPP).
-        # Set _GR00T_NATIVE_CONV3D=1 to force native Conv3D (test if CANN supports it).
+        # Conv3D strategy (priority: env var > script flag > RC auto-detect):
+        #   _GR00T_NATIVE_CONV3D=1  → force native Conv3D
+        #   --conv3d-replace        → force reshape+matmul replacement
+        #   default                 → RC uses replacement, DUO uses native
         if getattr(self, '_use_conv3d_replacement', None) is None:
             if os.environ.get("_GR00T_NATIVE_CONV3D") == "1":
                 self._use_conv3d_replacement = False
+            elif getattr(self, '_force_conv3d_replace', False):
+                self._use_conv3d_replacement = True
             else:
                 try:
                     from npu_utils import _is_rc_device
@@ -381,10 +385,22 @@ class Qwen3Backbone(torch.nn.Module):
                 except ImportError:
                     self._use_conv3d_replacement = False
 
+        _prof = getattr(self, '_enable_profiling', False)
+        _sync = getattr(self, '_profile_sync', False) and _prof
+
+        if _sync: torch.npu.synchronize()
+        t0 = time.time()
         if self._use_conv3d_replacement:
             hidden_states = self._conv3d_as_linear(pixel_values, visual.patch_embed.proj)
         else:
             hidden_states = visual.patch_embed(pixel_values)
+        if _sync: torch.npu.synchronize()
+        t_conv3d = time.time() - t0
+
+        if _prof:
+            mode = "reshape+matmul" if self._use_conv3d_replacement else "native"
+            print(f"[PROF] conv3d ({mode}): {t_conv3d*1000:.1f}ms")
+
         hidden_states = hidden_states + self._cached_visual_pos_embeds.to(
             hidden_states.device, hidden_states.dtype
         )

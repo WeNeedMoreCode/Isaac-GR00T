@@ -681,6 +681,12 @@ class ArgsConfig:
     instrument: bool = False
     """Enable per-step instrumentation: backbone/action_head timing breakdown with NPU sync."""
 
+    no_ffn_split4: bool = False
+    """Disable FFN split4 (6144→1536x4). Compare backbone lm time with/without to measure overhead."""
+
+    conv3d_replace: bool = False
+    """Force Conv3D→reshape+matmul replacement (even on non-RC). Test transData overhead on DUO."""
+
     seed: int = 42
     """Seed to use for reproducibility."""
 
@@ -1068,6 +1074,14 @@ def main(args: ArgsConfig):
         policy.model.backbone._enable_profiling = True
         policy.model._profile_sync = True
         logging.info("Instrumentation enabled (with NPU sync for accurate timing)")
+
+    if args.no_ffn_split4:
+        policy.model.backbone._skip_ffn_split4 = True
+        logging.info("FFN split4 disabled")
+
+    if args.conv3d_replace:
+        policy.model.backbone._force_conv3d_replace = True
+        logging.info("Conv3D replacement forced ON")
 
     # Apply inference mode
     if args.inference_mode == "trt_full_pipeline":
