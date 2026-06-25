@@ -1073,6 +1073,7 @@ def main(args: ArgsConfig):
         policy.model._enable_profiling = True
         policy.model.backbone._enable_profiling = True
         policy.model._profile_sync = True
+        policy.model.backbone._profile_sync = True
         logging.info("Instrumentation enabled (with NPU sync for accurate timing)")
 
     if args.no_ffn_split4:
