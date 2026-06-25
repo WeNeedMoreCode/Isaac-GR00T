@@ -170,6 +170,10 @@ class Gr00tPolicy(BasePolicy):
 
             if compile and _COMPILE_VISUAL_ENCODER:
                 compile_for_npu(model.backbone, "_preprocess_vl_input")
+                # Also compile _compiled_visual_forward separately so the eager
+                # profiling path (_preprocess_vl_input_profiled) can call it as
+                # an opaque compiled op for accurate visual encoder timing.
+                compile_for_npu(model.backbone, "_compiled_visual_forward")
             if compile and _COMPILE_LANGUAGE_MODEL:
                 compile_for_npu(model.backbone, "_language_model_forward")
             if compile and _COMPILE_ACTION_HEAD:
