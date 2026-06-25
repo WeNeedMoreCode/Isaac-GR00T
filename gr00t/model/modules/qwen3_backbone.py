@@ -414,6 +414,106 @@ class Qwen3Backbone(torch.nn.Module):
         hidden_states = visual.merger(hidden_states)
         return hidden_states.squeeze(0), deepstack_feature_lists
 
+    # ------------------------------------------------------------------
+    # Visual encoder sub-functions (for profiled path)
+    # Each is compiled separately so the eager orchestrator below can
+    # time them individually. Production path inlines _compiled_visual_forward
+    # above; profile path calls these 3 sub-functions instead.
+    # ------------------------------------------------------------------
+
+    def _compiled_visual_conv3d(self, pixel_values: torch.Tensor):
+        """Conv3D / patch embed + pos embed add + dtype casts. Compilable."""
+        visual = self.model.model.visual
+
+        # Conv3D strategy (priority: env var > script flag > RC auto-detect):
+        if getattr(self, '_use_conv3d_replacement', None) is None:
+            if os.environ.get("_GR00T_NATIVE_CONV3D") == "1":
+                self._use_conv3d_replacement = False
+            elif getattr(self, '_force_conv3d_replace', False):
+                self._use_conv3d_replacement = True
+            else:
+                try:
+                    from npu_utils import _is_rc_device
+                    self._use_conv3d_replacement = _is_rc_device()
+                except ImportError:
+                    self._use_conv3d_replacement = False
+
+        if self._use_conv3d_replacement:
+            hidden_states = self._conv3d_as_linear(pixel_values, visual.patch_embed.proj)
+        else:
+            hidden_states = visual.patch_embed(pixel_values)
+
+        hidden_states = hidden_states + self._cached_visual_pos_embeds.to(
+            hidden_states.device, hidden_states.dtype
+        )
+        position_embeddings = (
+            self._cached_visual_pe_cos.to(hidden_states.device, hidden_states.dtype),
+            self._cached_visual_pe_sin.to(hidden_states.device, hidden_states.dtype),
+        )
+        cu_seqlens = self._cached_visual_cu_seqlens.to(hidden_states.device)
+        # Use 3D tensors for better torchair compiled precision
+        hidden_states = hidden_states.unsqueeze(0)
+        return hidden_states, position_embeddings, cu_seqlens
+
+    def _compiled_visual_blocks(self, hidden_states, position_embeddings, cu_seqlens):
+        """16-layer visual transformer + deepstack mergers. Compilable."""
+        visual = self.model.model.visual
+        deepstack_feature_lists = []
+        for layer_num, blk in enumerate(visual.blocks):
+            hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+            )
+            if layer_num in visual.deepstack_visual_indexes:
+                idx = visual.deepstack_visual_indexes.index(layer_num)
+                deepstack_feature = visual.deepstack_merger_list[idx](hidden_states.squeeze(0))
+                deepstack_feature_lists.append(deepstack_feature)
+        return hidden_states, deepstack_feature_lists
+
+    def _compiled_visual_merger(self, hidden_states):
+        """Final merger. Compilable."""
+        visual = self.model.model.visual
+        hidden_states = visual.merger(hidden_states)
+        return hidden_states.squeeze(0)
+
+    def _compiled_visual_forward_profiled(self, pixel_values: torch.Tensor):
+        """Eager orchestrator for visual forward with per-stage timing.
+
+        Calls the 3 sub-functions (each separately compiled) so we can see
+        conv3d vs blocks vs merger breakdown.
+        """
+        _sync = getattr(self, '_profile_sync', False)
+
+        # [A] conv3d + pos embed
+        if _sync: torch.npu.synchronize()
+        t0 = time.time()
+        hidden_states, position_embeddings, cu_seqlens = self._compiled_visual_conv3d(pixel_values)
+        if _sync: torch.npu.synchronize()
+        t_conv3d = (time.time() - t0) * 1000
+
+        # [B] 16-layer blocks
+        if _sync: torch.npu.synchronize()
+        t0 = time.time()
+        hidden_states, deepstack_feature_lists = self._compiled_visual_blocks(
+            hidden_states, position_embeddings, cu_seqlens
+        )
+        if _sync: torch.npu.synchronize()
+        t_blocks = (time.time() - t0) * 1000
+
+        # [C] merger
+        if _sync: torch.npu.synchronize()
+        t0 = time.time()
+        hidden_states = self._compiled_visual_merger(hidden_states)
+        if _sync: torch.npu.synchronize()
+        t_merger = (time.time() - t0) * 1000
+
+        logging.info(
+            "[PROF] visual:  conv3d=%.1f  blocks=%.1f  merger=%.1f"
+            % (t_conv3d, t_blocks, t_merger)
+        )
+        return hidden_states, deepstack_feature_lists
+
     def _preprocess_vl_input(self, vl_input: dict) -> dict:
         """Preprocess VL input: text embedding, image encoding, position/mask/RoPE computation.
 
@@ -491,11 +591,11 @@ class Qwen3Backbone(torch.nn.Module):
         if _sync: torch.npu.synchronize()
         t_text = (time.time() - t0) * 1000
 
-        # 2. Visual forward (compiled, opaque — same code as production path)
+        # 2. Visual forward (compiled sub-calls, with internal per-stage timing)
         if _sync: torch.npu.synchronize()
         t0 = time.time()
         pixel_values = vl_input["pixel_values"].to(qwen3vl_model.visual.dtype)
-        raw_embeds, deepstack_image_embeds = self._compiled_visual_forward(pixel_values)
+        raw_embeds, deepstack_image_embeds = self._compiled_visual_forward_profiled(pixel_values)
         image_embeds = raw_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         if _sync: torch.npu.synchronize()
         t_visual = (time.time() - t0) * 1000
