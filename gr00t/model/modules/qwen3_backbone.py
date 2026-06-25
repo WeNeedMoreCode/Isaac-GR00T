@@ -504,20 +504,31 @@ class Qwen3Backbone(torch.nn.Module):
         _prof = getattr(self, '_enable_profiling', False)
         _sync = getattr(self, '_profile_sync', False) and _prof
 
+        # [A] setup: set_frozen + dict + ensure_cache
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t0 = time.time()
         self.set_frozen_modules_to_eval_mode()
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
-
-        # Step 0: Ensure visual cache (eager, not compilable)
         self._ensure_visual_cache()
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t_setup = time.time() - t0
 
-        # Step 1: Pre-compute non-compilable values
+        # [B] image_mask + nonzero (eager NPU ops, not compiled)
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t0 = time.time()
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
         visual_indices = image_mask[0].nonzero().squeeze(-1)
         vl_input["visual_indices"] = visual_indices
         vl_input["image_mask"] = image_mask
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t_mask = time.time() - t0
 
-        # Step 1b: Position IDs (get_rope_index uses .tolist(), not compilable)
+        # [C] rope_idx
         if _prof:
             if _sync: torch.npu.synchronize()
             t0 = time.time()
@@ -540,7 +551,7 @@ class Qwen3Backbone(torch.nn.Module):
             if _sync: torch.npu.synchronize()
             t_rope = time.time() - t0
 
-        # Step 2: Preprocess (compilable with torchair)
+        # [D] preprocess (compiled)
         if _prof:
             if _sync: torch.npu.synchronize()
             t0 = time.time()
@@ -549,7 +560,7 @@ class Qwen3Backbone(torch.nn.Module):
             if _sync: torch.npu.synchronize()
             t_preprocess = time.time() - t0
 
-        # Step 3: Language model (compilable with torchair)
+        # [E] lm (compiled)
         if _prof:
             if _sync: torch.npu.synchronize()
             t0 = time.time()
@@ -558,15 +569,25 @@ class Qwen3Backbone(torch.nn.Module):
             if _sync: torch.npu.synchronize()
             t_lm = time.time() - t0
 
-        # Step 4: Output processing
+        # [F] output: attention_mask + BatchFeature
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t0 = time.time()
         attention_mask = vl_input["attention_mask"] == 1
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t_output = time.time() - t0
 
         if _prof:
             self._prof_step = getattr(self, '_prof_step', 0) + 1
             if self._prof_step <= 4:
-                print(f"[PROF] backbone: rope_idx={t_rope*1000:.1f}ms  "
-                      f"preprocess={t_preprocess*1000:.1f}ms  lm={t_lm*1000:.1f}ms  "
-                      f"total={((t_rope+t_preprocess+t_lm)*1000):.1f}ms")
+                print(f"[PROF] backbone:"
+                      f"  setup={t_setup*1000:.1f}"
+                      f"  mask={t_mask*1000:.1f}"
+                      f"  rope={t_rope*1000:.1f}"
+                      f"  preprocess={t_preprocess*1000:.1f}"
+                      f"  lm={t_lm*1000:.1f}"
+                      f"  output={t_output*1000:.1f}")
 
         return BatchFeature(
             data={
