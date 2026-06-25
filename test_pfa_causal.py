@@ -67,7 +67,8 @@ def test_mask_semantics():
     print("STEP 1: Causal mask semantics (which True convention?)")
     print("=" * 70)
 
-    B, N, S, D = 1, 8, 16, 64
+    # S=32: S=16 hits a tiling bug in 310P1 PFA. Use S >= 32.
+    B, N, S, D = 1, 8, 32, 64
     scale = 1.0 / math.sqrt(D)
     q = torch.randn(B, N, S, D, dtype=torch.float16).npu()
     k = torch.randn(B, N, S, D, dtype=torch.float16).npu()
@@ -76,12 +77,10 @@ def test_mask_semantics():
     with torch.no_grad():
         ref = reference_causal_attention(q, k, v, scale)
 
-    # 3 candidates: try each and report diff vs reference
+    # 2D bool upper=True is the verified-correct convention from test_pfa_mask_diag.py
+    # (True = mask-out, False = keep; upper-triangular True masks the future)
     candidates = [
-        ("2D lower=True (tril)",  torch.tril(torch.ones(S, S, dtype=torch.bool)).npu()),
-        ("2D upper=True (~tril)", (~torch.tril(torch.ones(S, S, dtype=torch.bool))).npu()),
-        ("4D [1,1,S,S] lower=True", torch.tril(torch.ones(1, 1, S, S, dtype=torch.bool)).npu()),
-        ("4D [1,1,S,S] upper=True", (~torch.tril(torch.ones(1, 1, S, S, dtype=torch.bool))).npu()),
+        ("2D upper=True (~tril) ★", (~torch.tril(torch.ones(S, S, dtype=torch.bool))).npu()),
     ]
     winner = None
     for name, mask in candidates:
@@ -97,11 +96,15 @@ def test_mask_semantics():
             print(f"  [{name:30s}]  FAIL: {e}")
 
     if winner is None:
-        print("\n>>> No mask convention matched! Either bool mask semantics differ,")
-        print(">>> or PFA can't do causal on 310P. Try int8 mask next.")
+        print("\n>>> No mask convention matched! Re-run test_pfa_mask_diag.py to recheck.")
     else:
-        print(f"\n>>> Winner: {winner}")
+        print(f"\n>>> Confirmed: {winner}")
     return winner
+
+
+def _causal_mask(S):
+    """Correct causal mask for 310P1 PFA: 2D bool, upper=True (mask-out future)."""
+    return (~torch.tril(torch.ones(S, S, dtype=torch.bool))).npu()
 
 
 def test_gqa_workaround():
@@ -132,7 +135,7 @@ def test_gqa_workaround():
     v_mha = repeat_kv(v_gqa, n_rep).contiguous()
 
     # Reference with same expansion
-    mask_2d = torch.tril(torch.ones(S, S, dtype=torch.bool)).npu()
+    mask_2d = _causal_mask(S)
     with torch.no_grad():
         ref = reference_causal_attention(q, k_mha, v_mha, scale)
 
@@ -160,14 +163,13 @@ def test_performance():
         ("S=1024 (long)",   1, 16, 1024, 128),
         ("S=2048 (xlong)",  1, 16, 2048, 128),
     ]
-    mask_winner_is_lower = True  # will be set by step 1; default assume lower=True
 
     for name, B, N, S, D in cases:
         scale = 1.0 / math.sqrt(D)
         q = torch.randn(B, N, S, D, dtype=torch.float16).npu()
         k = torch.randn(B, N, S, D, dtype=torch.float16).npu()
         v = torch.randn(B, N, S, D, dtype=torch.float16).npu()
-        mask = torch.tril(torch.ones(S, S, dtype=torch.bool)).npu()
+        mask = _causal_mask(S)
 
         try:
             t_pfa = bench(lambda: pfa(q, k, v, N, scale, mask))
