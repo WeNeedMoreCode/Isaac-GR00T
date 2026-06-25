@@ -433,16 +433,22 @@ class Qwen3Backbone(torch.nn.Module):
         raw_embeds, deepstack_image_embeds = self._compiled_visual_forward(pixel_values)
         image_embeds = raw_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
 
-        # 3. Causal mask + cache position
-        cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
-        causal_mask = create_causal_mask(
-            config=lm.config,
-            input_embeds=inputs_embeds,
-            attention_mask=vl_input["attention_mask"],
-            cache_position=cache_position,
-            past_key_values=None,
-            position_ids=vl_input["text_position_ids"],
-        )
+        # 3. Causal mask + cache position (use cached if available from forward())
+        cached_mask = vl_input.get("_cached_causal_mask", None)
+        cached_pos = vl_input.get("_cached_cache_position", None)
+        if cached_mask is not None:
+            causal_mask = cached_mask
+            cache_position = cached_pos
+        else:
+            cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
+            causal_mask = create_causal_mask(
+                config=lm.config,
+                input_embeds=inputs_embeds,
+                attention_mask=vl_input["attention_mask"],
+                cache_position=cache_position,
+                past_key_values=None,
+                position_ids=vl_input["text_position_ids"],
+            )
 
         # 4. RoPE embeddings
         position_embeddings = lm.rotary_emb(inputs_embeds, vl_input["position_ids"])
@@ -551,7 +557,31 @@ class Qwen3Backbone(torch.nn.Module):
             if _sync: torch.npu.synchronize()
             t_rope = time.time() - t0
 
-        # [D] preprocess (compiled)
+        # [D-mask] causal mask (eager, cached — removed from compiled graph)
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t0 = time.time()
+        if getattr(self, '_cached_causal_mask', None) is None:
+            from transformers.masking_utils import create_causal_mask as _ccm
+            lm = self.model.model.language_model
+            _dummy = self.model.model.get_input_embeddings()(vl_input["input_ids"])
+            _cp = torch.arange(0, _dummy.shape[1], device=_dummy.device)
+            self._cached_causal_mask = _ccm(
+                config=lm.config, input_embeds=_dummy,
+                attention_mask=vl_input["attention_mask"], cache_position=_cp,
+                past_key_values=None, position_ids=vl_input["text_position_ids"],
+            )
+            self._cached_cache_position = _cp
+            if _prof:
+                print(f"[PROF] causal_mask computed (first call)")
+        if _prof:
+            if _sync: torch.npu.synchronize()
+            t_mask_create = time.time() - t0
+
+        vl_input["_cached_causal_mask"] = self._cached_causal_mask
+        vl_input["_cached_cache_position"] = self._cached_cache_position
+
+        # [D] preprocess (compiled, skips create_causal_mask when cached)
         if _prof:
             if _sync: torch.npu.synchronize()
             t0 = time.time()
@@ -583,8 +613,9 @@ class Qwen3Backbone(torch.nn.Module):
             if self._prof_step <= 4:
                 print(f"[PROF] backbone:"
                       f"  setup={t_setup*1000:.1f}"
-                      f"  mask={t_mask*1000:.1f}"
+                      f"  mask_idx={t_mask*1000:.1f}"
                       f"  rope={t_rope*1000:.1f}"
+                      f"  mask_create={t_mask_create*1000:.1f}"
                       f"  preprocess={t_preprocess*1000:.1f}"
                       f"  lm={t_lm*1000:.1f}"
                       f"  output={t_output*1000:.1f}")
