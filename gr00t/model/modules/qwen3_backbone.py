@@ -859,6 +859,8 @@ def _patch_lm_attention_pfa():
 
     def _pfa_eager_forward(module, query, key, value, attention_mask,
                             scaling, dropout=0.0, **kwargs):
+        # DEBUG: confirm this fn is actually called at runtime
+        logger.info(f"[PFA DEBUG] _pfa_eager_forward called! S={query.shape[2]} layer_idx={module.layer_idx}")
         # GQA: expand KV heads to match Q heads (310P1 PFA only supports num_kv_heads == num_heads)
         key_states = qwen3vl_mod.repeat_kv(key, module.num_key_value_groups).contiguous()
         value_states = qwen3vl_mod.repeat_kv(value, module.num_key_value_groups).contiguous()
