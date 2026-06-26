@@ -833,22 +833,27 @@ def _patch_lm_attention_pfa():
     attention. Requires:
       - 2D bool causal mask (upper-tri True = mask-out future)
       - S >= 32 (smaller S hits a tiling bug)
+      - **S 16-aligned when atten_mask is provided** (310P1 tiling constraint,
+        not in docs; tested via test_pfa_align.py)
       - GQA expanded via repeat_kv before PFA (310P1 PFA doesn't support
         num_key_value_heads != num_heads)
       - All tensors contiguous
 
     Assumes no padding (verified via test_attn_mask.py for GR00T batch=1).
+
+    For non-aligned S (e.g. LM S=277), pads to next multiple of 16 along seq
+    dim, masks padded key positions, slices output back to original S.
     """
     import transformers.models.qwen3_vl.modeling_qwen3_vl as qwen3vl_mod
 
     _mask_cache = {}
 
-    def _get_causal_mask(S, device):
-        """2D [S, S] bool, upper-triangular True = mask-out future."""
-        key = (S, str(device))
+    def _get_causal_mask(S_pad, device):
+        """2D [S_pad, S_pad] bool, upper-tri True = mask-out future. Cached."""
+        key = (S_pad, str(device))
         if key not in _mask_cache:
             _mask_cache[key] = (~torch.tril(
-                torch.ones(S, S, dtype=torch.bool)
+                torch.ones(S_pad, S_pad, dtype=torch.bool)
             )).to(device)
         return _mask_cache[key]
 
@@ -860,7 +865,19 @@ def _patch_lm_attention_pfa():
         q = query.contiguous()
 
         B, N, S, D = q.shape
-        mask = _get_causal_mask(S, q.device)
+        # Pad S to multiple of 16 (310P1 PFA + atten_mask alignment requirement)
+        pad = (16 - S % 16) % 16
+        if pad > 0:
+            q = F.pad(q, (0, 0, 0, pad))              # [B, N, S_pad, D]
+            key_states = F.pad(key_states, (0, 0, 0, pad))
+            value_states = F.pad(value_states, (0, 0, 0, pad))
+
+        S_pad = S + pad
+        # Mask: base causal (S_pad x S_pad) + padded key cols masked out
+        mask = _get_causal_mask(S_pad, q.device)
+        if pad > 0:
+            mask = mask.clone()
+            mask[:, -pad:] = True  # padded key positions visible to nobody
 
         attn_output = torch_npu.npu_prompt_flash_attention(
             q, key_states, value_states,
@@ -869,10 +886,13 @@ def _patch_lm_attention_pfa():
             scale_value=float(scaling),
             atten_mask=mask,
             sparse_mode=0,
-        )
+        )  # [B, N, S_pad, D]
+
+        if pad > 0:
+            attn_output = attn_output[:, :, :S, :]  # discard padded query rows
         # PFA returns [B, N, S, D]; original contract returns [B, S, N, D]
         attn_output = attn_output.transpose(1, 2).contiguous()
         return attn_output, None  # attn_weights unused downstream
 
     qwen3vl_mod.eager_attention_forward = _pfa_eager_forward
-    logger.info("Patched Qwen3VL LM eager_attention_forward -> npu_prompt_flash_attention")
+    logger.info("Patched Qwen3VL LM eager_attention_forward -> npu_prompt_flash_attention (S padded to 16-align)")
