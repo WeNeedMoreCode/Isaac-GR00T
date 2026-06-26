@@ -164,6 +164,11 @@ class Gr00tPolicy(BasePolicy):
             if nz_cast:
                 format_cast_to_nz(model)
 
+            # Patch LM attention to use PFA before compile (so compiled graph
+            # traces through PFA call instead of explicit matmul+softmax).
+            from gr00t.model.modules.qwen3_backbone import _patch_lm_attention_pfa
+            _patch_lm_attention_pfa()
+
             import gc
             gc.collect()
             torch.npu.empty_cache()

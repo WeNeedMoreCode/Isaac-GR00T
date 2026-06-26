@@ -820,3 +820,59 @@ class Qwen3Backbone(torch.nn.Module):
                 "image_mask": image_mask,
             }
         )
+
+
+def _patch_lm_attention_pfa():
+    """Replace Qwen3VLTextAttention's eager_attention_forward with PFA.
+
+    PFA (npu_prompt_flash_attention) is the FlashAttention fused kernel for
+    Ascend inference cards (310P series). Replaces explicit
+    matmul + softmax(fp32) + matmul in the LM attention path.
+
+    Verified on 310P1 (DUO 310P3): ~11x speedup at S=1024 over explicit
+    attention. Requires:
+      - 2D bool causal mask (upper-tri True = mask-out future)
+      - S >= 32 (smaller S hits a tiling bug)
+      - GQA expanded via repeat_kv before PFA (310P1 PFA doesn't support
+        num_key_value_heads != num_heads)
+      - All tensors contiguous
+
+    Assumes no padding (verified via test_attn_mask.py for GR00T batch=1).
+    """
+    import transformers.models.qwen3_vl.modeling_qwen3_vl as qwen3vl_mod
+
+    _mask_cache = {}
+
+    def _get_causal_mask(S, device):
+        """2D [S, S] bool, upper-triangular True = mask-out future."""
+        key = (S, str(device))
+        if key not in _mask_cache:
+            _mask_cache[key] = (~torch.tril(
+                torch.ones(S, S, dtype=torch.bool)
+            )).to(device)
+        return _mask_cache[key]
+
+    def _pfa_eager_forward(module, query, key, value, attention_mask,
+                            scaling, dropout=0.0, **kwargs):
+        # GQA: expand KV heads to match Q heads (310P1 PFA only supports num_kv_heads == num_heads)
+        key_states = qwen3vl_mod.repeat_kv(key, module.num_key_value_groups).contiguous()
+        value_states = qwen3vl_mod.repeat_kv(value, module.num_key_value_groups).contiguous()
+        q = query.contiguous()
+
+        B, N, S, D = q.shape
+        mask = _get_causal_mask(S, q.device)
+
+        attn_output = torch_npu.npu_prompt_flash_attention(
+            q, key_states, value_states,
+            num_heads=N,
+            input_layout="BNSD",
+            scale_value=float(scaling),
+            atten_mask=mask,
+            sparse_mode=0,
+        )
+        # PFA returns [B, N, S, D]; original contract returns [B, S, N, D]
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        return attn_output, None  # attn_weights unused downstream
+
+    qwen3vl_mod.eager_attention_forward = _pfa_eager_forward
+    logger.info("Patched Qwen3VL LM eager_attention_forward -> npu_prompt_flash_attention")

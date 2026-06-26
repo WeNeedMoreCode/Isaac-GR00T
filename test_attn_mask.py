@@ -82,5 +82,8 @@ qwb.Qwen3Backbone.forward = _spy_forward
 
 
 # Run normal inference
-from scripts.deployment.standalone_inference_script import main
-main()
+import tyro
+from scripts.deployment.standalone_inference_script import main, ArgsConfig
+
+config = tyro.cli(ArgsConfig)
+main(config)
