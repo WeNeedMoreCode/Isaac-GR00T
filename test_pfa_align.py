@@ -16,7 +16,11 @@ import torch_npu
 
 
 def try_pfa_with_mask(S, D=128, N=16, B=1):
-    """Return True if PFA + mask runs without error at this S."""
+    """Return True if PFA + mask runs without error at this S.
+
+    Note: aicore exceptions on 310P1 may poison the device, making subsequent
+    tests fail spuriously. Caller should restart process if None is returned.
+    """
     scale = 1.0 / math.sqrt(D)
     q = torch.randn(B, N, S, D, dtype=torch.float16).npu()
     k = torch.randn(B, N, S, D, dtype=torch.float16).npu()
@@ -33,15 +37,14 @@ def try_pfa_with_mask(S, D=128, N=16, B=1):
             atten_mask=mask,
             sparse_mode=0,
         )
+        torch.npu.synchronize()  # force any async errors to surface
         return True
     except Exception as e:
-        # extract the meaningful part of the error
         msg = str(e)
-        # find "attention mask must be NULL" type messages
-        for line in msg.split('\n'):
-            if 'attention mask' in line.lower() or 'unalign' in line.lower() or 'align' in line.lower():
-                return False
-        # other error (aicore etc.) - report separately
+        # tiling rejection = "must be NULL"
+        if 'must be NULL' in msg or 'unAlign' in msg:
+            return False
+        # aicore exception - device may be poisoned
         return None
 
 
@@ -50,13 +53,16 @@ def main():
     print(f">>> Finding S alignment threshold for PFA + atten_mask\n")
 
     # Test S values: aligned + unaligned around 277
+    # NOTE: S<32 hits a separate aicore bug (poisons device), skip them.
     test_S = [
-        # 16-aligned baseline
+        # 32-aligned baseline (known-good)
         256, 272, 288, 304, 320,
-        # non-aligned around 277
-        264, 266, 268, 270, 272, 274, 276, 277, 278, 280, 282, 284, 286,
-        # smaller (for S<32 bug boundary)
-        16, 24, 28, 30, 31, 32, 33, 34, 40, 48, 64,
+        # non-aligned around 277 (real LM S)
+        264, 266, 268, 270, 274, 276, 277, 278, 280, 282, 284, 286,
+        # 64-aligned controls
+        384, 512,
+        # boundary near 32
+        32, 33, 34, 36, 40, 48, 64, 96,
     ]
     test_S = sorted(set(test_S))
 
@@ -71,9 +77,13 @@ def main():
         elif ok is False:
             tag = "FAIL (mask rejected)"
         else:
-            tag = "FAIL (other)"
+            tag = "FAIL (aicore) — device poisoned, stopping"
         results[S] = ok
         print(f"{S:>6}  {S%16:>5}  {S%32:>5}  {S%64:>5}  {tag}")
+        if ok is None:
+            print(f"\n>>> aicore exception at S={S}. Device is now in bad state.")
+            print(f">>> Re-run with this S excluded, or restart process.")
+            break
 
     # Summarize: which alignment seems to be required
     print("\n>>> Summary:")
