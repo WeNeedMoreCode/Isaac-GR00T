@@ -859,6 +859,12 @@ def _patch_lm_attention_pfa():
 
     def _pfa_eager_forward(module, query, key, value, attention_mask,
                             scaling, dropout=0.0, **kwargs):
+        # DEBUG: deliberately return zeros to check if this fn is actually called
+        # at runtime. If MSE explodes, fn is called. If MSE unchanged, fn is bypassed.
+        B, N, S, D = query.shape
+        attn_output = torch.zeros(B, S, N, D, dtype=query.dtype, device=query.device)
+        return attn_output, None
+
         # GQA: expand KV heads to match Q heads (310P1 PFA only supports num_kv_heads == num_heads)
         key_states = qwen3vl_mod.repeat_kv(key, module.num_key_value_groups).contiguous()
         value_states = qwen3vl_mod.repeat_kv(value, module.num_key_value_groups).contiguous()
