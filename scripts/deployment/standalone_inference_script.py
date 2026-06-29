@@ -1159,8 +1159,12 @@ def main(args: ArgsConfig):
             ),
             record_shapes=True,
             with_stack=True,
+            with_modules=True,
             experimental_config=torch_npu.profiler._ExperimentalConfig(
                 profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+                l2_cache=True,
+                op_attr=True,
                 data_simplification=True,
             ),
         )
