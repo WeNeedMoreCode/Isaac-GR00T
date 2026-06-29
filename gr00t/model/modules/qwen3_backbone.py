@@ -742,10 +742,15 @@ class Qwen3Backbone(torch.nn.Module):
             t_rope = time.time() - t0
 
         # [D-mask] causal mask (eager, cached — removed from compiled graph)
+        # Cache key includes sequence length S so multi-traj in single process
+        # doesn't reuse a mask computed for a different S (would cause shape
+        # mismatch in eager_attention_forward).
         if _prof:
             if _sync: torch.npu.synchronize()
             t0 = time.time()
-        if getattr(self, '_cached_causal_mask', None) is None:
+        _cur_S = vl_input["input_ids"].shape[1]
+        _cached_mask = getattr(self, '_cached_causal_mask', None)
+        if _cached_mask is None or _cached_mask.shape[-1] != _cur_S:
             from transformers.masking_utils import create_causal_mask as _ccm
             lm = self.model.model.language_model
             _dummy = self.model.model.get_input_embeddings()(vl_input["input_ids"])
@@ -757,7 +762,7 @@ class Qwen3Backbone(torch.nn.Module):
             )
             self._cached_cache_position = _cp
             if _prof:
-                print(f"[PROF] causal_mask computed (first call)")
+                print(f"[PROF] causal_mask computed (S={_cur_S})")
         if _prof:
             if _sync: torch.npu.synchronize()
             t_mask_create = time.time() - t0
