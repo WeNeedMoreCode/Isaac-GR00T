@@ -376,18 +376,14 @@ class Qwen3Backbone(torch.nn.Module):
         """
         visual = self.model.model.visual
 
-        # Conv3D strategy (priority: env var > script flag > RC auto-detect):
+        # Conv3D strategy: replacement (matmul-as-conv3d) is faster than native
+        # Conv3D on every tested NPU (RC 310P1: 1.2ms vs DUO 310P3 native: 31ms).
+        # Default ON for all NPU; override with _GR00T_NATIVE_CONV3D=1 to use native.
         if getattr(self, '_use_conv3d_replacement', None) is None:
             if os.environ.get("_GR00T_NATIVE_CONV3D") == "1":
                 self._use_conv3d_replacement = False
-            elif getattr(self, '_force_conv3d_replace', False):
-                self._use_conv3d_replacement = True
             else:
-                try:
-                    from npu_utils import _is_rc_device
-                    self._use_conv3d_replacement = _is_rc_device()
-                except ImportError:
-                    self._use_conv3d_replacement = False
+                self._use_conv3d_replacement = True
 
         if self._use_conv3d_replacement:
             hidden_states = self._conv3d_as_linear(pixel_values, visual.patch_embed.proj)
@@ -432,18 +428,14 @@ class Qwen3Backbone(torch.nn.Module):
         """Conv3D / patch embed + pos embed add + dtype casts. Compilable."""
         visual = self.model.model.visual
 
-        # Conv3D strategy (priority: env var > script flag > RC auto-detect):
+        # Conv3D strategy: replacement (matmul-as-conv3d) is faster than native
+        # Conv3D on every tested NPU (RC 310P1: 1.2ms vs DUO 310P3 native: 31ms).
+        # Default ON for all NPU; override with _GR00T_NATIVE_CONV3D=1 to use native.
         if getattr(self, '_use_conv3d_replacement', None) is None:
             if os.environ.get("_GR00T_NATIVE_CONV3D") == "1":
                 self._use_conv3d_replacement = False
-            elif getattr(self, '_force_conv3d_replace', False):
-                self._use_conv3d_replacement = True
             else:
-                try:
-                    from npu_utils import _is_rc_device
-                    self._use_conv3d_replacement = _is_rc_device()
-                except ImportError:
-                    self._use_conv3d_replacement = False
+                self._use_conv3d_replacement = True
 
         if self._use_conv3d_replacement:
             hidden_states = self._conv3d_as_linear(pixel_values, visual.patch_embed.proj)
