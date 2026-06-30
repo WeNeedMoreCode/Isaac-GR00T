@@ -129,10 +129,7 @@ class Gr00tPolicy(BasePolicy):
         else:
             model = AutoModel.from_pretrained(model_dir, **load_kwargs)
         model.eval()  # Set model to evaluation mode
-        if is_npu and model.device.type != "npu":
-            model = model.to(device=device, dtype=torch.float16)
-        else:
-            model.to(device=device, dtype=torch.float16)
+        model = model.to(device=device, dtype=torch.float16)
 
         # Conv3D lacks a precompiled kernel under jit_compile=False.
         # Only needed when visual encoder runs in eager mode (not compiled by torchair).

@@ -498,8 +498,8 @@ def run_single_trajectory(
         torch.npu.synchronize()
 
         # Memory tracking at step boundary
-        gc.collect()
-        torch.npu.empty_cache()
+        # gc.collect()
+        # torch.npu.empty_cache()
 
         # Per-step time printed regardless of skip (helps spot which step is the outlier)
         logging.info(
