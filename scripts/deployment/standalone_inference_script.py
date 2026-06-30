@@ -383,8 +383,6 @@ def run_single_trajectory(
     action_horizon=16,
     skip_timing_steps=1,
     pipeline_overlap=True,
-    npu_prof=None,
-    step_start=0,
 ):
     """
     Run inference on a single trajectory.
@@ -432,8 +430,8 @@ def run_single_trajectory(
     modality_configs = deepcopy(loader.modality_configs)
     modality_configs.pop("action")
 
-    # List of step counts to process (filtered by step_start for subprocess mode)
-    step_counts = [sc for sc in range(0, actual_steps, action_horizon) if sc >= step_start]
+    # List of step counts to process
+    step_counts = list(range(0, actual_steps, action_horizon))
 
     # Inference loop
     num_inference_steps = len(step_counts)
@@ -502,10 +500,6 @@ def run_single_trajectory(
         # Memory tracking at step boundary
         gc.collect()
         torch.npu.empty_cache()
-
-        # Notify NPU profiler of step boundary
-        if npu_prof is not None:
-            npu_prof.step()
 
         # Per-step time printed regardless of skip (helps spot which step is the outlier)
         logging.info(
@@ -630,9 +624,6 @@ class ArgsConfig:
     steps: int = 200
     """Maximum number of steps to evaluate (will be capped by trajectory length)."""
 
-    step_start: int = 0
-    """For subprocess isolation on RC devices: skip steps before this timestep. Default 0."""
-
     traj_ids: list[int] = field(default_factory=lambda: [0])
     """List of trajectory IDs to evaluate."""
 
@@ -675,17 +666,11 @@ class ArgsConfig:
     get_performance_stats: bool = True
     """Agreegate and summarize timing and accuracy stats across several runs"""
 
-    profile: bool = False
-    """Enable torch_npu.profiler profiling (results saved to ./prof_result)."""
+    per_traj: bool = False
+    """Run each trajectory in a separate subprocess. Required on RC (event pool leak across trajectories). DUO does not need this."""
 
-    instrument: bool = False
-    """Enable per-step instrumentation: backbone/action_head timing breakdown with NPU sync."""
-
-    no_ffn_split4: bool = False
-    """Disable FFN split4 (6144→1536x4). Compare backbone lm time with/without to measure overhead."""
-
-    conv3d_replace: bool = False
-    """Force Conv3D→reshape+matmul replacement (even on non-RC). Test transData overhead on DUO."""
+    cache_randn: bool = False
+    """Cache the noise tensor on first call and clone on subsequent calls. Saves per-step CPU->NPU copy."""
 
     seed: int = 42
     """Seed to use for reproducibility."""
@@ -695,107 +680,6 @@ class ArgsConfig:
 
     backbone_path: str | None = None
     """Local path to backbone model (e.g. ./checkpoints/Cosmos-Reason2-2B). Overrides config.model_name."""
-
-
-# On RC devices (Ascend 310P1), the driver leaks ~340 events per inference call,
-# hitting the 1024 event pool limit at the 3rd call. Subprocess isolation works
-# around this: each subprocess does at most STEPS_PER_BATCH inference calls,
-# then exits to release the event pool. torchair compile cache is on disk and
-# shared across subprocesses, so only the first subprocess pays compile cost.
-_GR00T_STEPS_PER_BATCH = 2
-
-
-def _orchestrate_subprocess(args: ArgsConfig):
-    """Spawn one subprocess per (trajectory, step batch) to bypass event pool leak."""
-    import subprocess as sp
-    import sys
-
-    # Use print, not logging: logging isn't configured yet at this point in main().
-    print("=" * 80)
-    print(f"[orchestrator] RC device: subprocess isolation ON, "
-          f"{_GR00T_STEPS_PER_BATCH} steps per subprocess")
-    print("=" * 80)
-
-    for traj_id in args.traj_ids:
-        step_start = 0
-        batch_idx = 0
-        while step_start < args.steps:
-            step_end = min(step_start + _GR00T_STEPS_PER_BATCH * args.action_horizon, args.steps)
-            out_file = f"/tmp/gr00t_pred_traj{traj_id}_batch{batch_idx}.npy"
-
-            # Inherit current argv but override traj-ids / steps / step-start
-            sub_argv = []
-            skip_next = False
-            for a in sys.argv[1:]:
-                if skip_next:
-                    skip_next = False
-                    continue
-                if a in ("--traj-ids", "--steps", "--step-start"):
-                    skip_next = True
-                    continue
-                if a.startswith(("--traj-ids=", "--steps=", "--step-start=")):
-                    continue
-                sub_argv.append(a)
-            sub_argv += [
-                "--traj-ids", str(traj_id),
-                "--steps", str(step_end),
-                "--step-start", str(step_start),
-            ]
-
-            env = os.environ.copy()
-            env["_GR00T_WORKER"] = "1"
-            env["_GR00T_OUT_FILE"] = out_file
-
-            print(f"\n[orchestrator] traj {traj_id} batch {batch_idx}: "
-                  f"step_start={step_start} step_end={step_end}")
-
-            # Spawn subprocess non-blocking, then poll for output file.
-            # Once the worker saves predictions, kill it — clean exit hangs on
-            # NPU cleanup (driver waits for events that will never complete).
-            import time
-            proc = sp.Popen([sys.executable] + sys.argv[:1] + sub_argv, env=env)
-            max_wait = 600  # 10 min hard cap for model load + 2 inferences
-            t0 = time.time()
-            killed = False
-            while True:
-                # Worker wrote the output file → done, kill before cleanup hangs
-                if os.path.exists(out_file):
-                    print(f"[orchestrator] predictions saved, killing subprocess "
-                          f"to skip NPU cleanup hang")
-                    proc.kill()
-                    proc.wait(timeout=30)
-                    killed = True
-                    break
-                # Subprocess died before saving (real error or trajectory ended)
-                if proc.poll() is not None:
-                    break
-                if time.time() - t0 > max_wait:
-                    print(f"[orchestrator] TIMEOUT after {max_wait}s, killing")
-                    proc.kill()
-                    proc.wait(timeout=30)
-                    break
-                time.sleep(2)
-
-            if os.path.exists(out_file):
-                import numpy as np
-                preds = np.load(out_file)
-                print(f"[orchestrator] batch {batch_idx} done, "
-                      f"predicted {len(preds)} actions"
-                      f"{' (killed after save)' if killed else ''}")
-                os.remove(out_file)
-            else:
-                # Worker produced no output → trajectory exhausted.
-                print(f"[orchestrator] batch {batch_idx} empty, "
-                      f"trajectory {traj_id} ended at step_start={step_start}")
-                break
-
-            step_start = step_end
-            batch_idx += 1
-
-    print("=" * 80)
-    print("[orchestrator] all trajectories completed")
-    print("=" * 80)
-    return [], None
 
 
 def _print_summary(all_mse, all_mae, all_timings, model_load_time, dataset_load_time):
@@ -983,23 +867,16 @@ def _orchestrate_per_traj(args: ArgsConfig):
 
 
 def main(args: ArgsConfig):
-    # Subprocess isolation is OPT-IN via env vars:
-    #   _GR00T_PER_TRAJ=1         one subprocess per trajectory (compile mode)
-    #   _GR00T_FORCE_SUBPROCESS=1 step-batching subprocess (eager mode, ≤2 steps/batch)
+    # Worker subprocess self-identifies via _GR00T_WORKER=1 (set by orchestrator).
     is_worker = os.environ.get("_GR00T_WORKER") == "1"
-    force_subprocess = os.environ.get("_GR00T_FORCE_SUBPROCESS") == "1"
-    per_traj = os.environ.get("_GR00T_PER_TRAJ") == "1"
     if (
         not is_worker
         and args.device.startswith("npu")
-        and not args.profile
+        and args.per_traj
+        and len(args.traj_ids) > 1
     ):
-        if per_traj and len(args.traj_ids) > 1:
-            print("[main] _GR00T_PER_TRAJ=1, one subprocess per trajectory")
-            return _orchestrate_per_traj(args)
-        if force_subprocess:
-            print("[main] _GR00T_FORCE_SUBPROCESS=1, using step-batching subprocess")
-            return _orchestrate_subprocess(args)
+        print("[main] --per-traj: one subprocess per trajectory")
+        return _orchestrate_per_traj(args)
 
     # NPU initialization
     if args.device.startswith("npu"):
@@ -1069,20 +946,9 @@ def main(args: ArgsConfig):
         logging.info(f"Denoising steps overridden to: {args.denoising_steps}")
     logging.info(f"Actual num_inference_timesteps: {policy.model.action_head.num_inference_timesteps}")
 
-    if args.instrument:
-        policy.model._enable_profiling = True
-        policy.model.backbone._enable_profiling = True
-        policy.model._profile_sync = True
-        policy.model.backbone._profile_sync = True
-        logging.info("Instrumentation enabled (with NPU sync for accurate timing)")
-
-    if args.no_ffn_split4:
-        policy.model.backbone._skip_ffn_split4 = True
-        logging.info("FFN split4 disabled")
-
-    if args.conv3d_replace:
-        policy.model.backbone._force_conv3d_replace = True
-        logging.info("Conv3D replacement forced ON")
+    if args.cache_randn:
+        policy.model._cache_randn = True
+        logging.info("Noise tensor caching enabled")
 
     # Apply inference mode
     if args.inference_mode == "trt_full_pipeline":
@@ -1140,36 +1006,6 @@ def main(args: ArgsConfig):
     pred_actions = []
     obs = None
 
-    # NPU profiler wrapper
-    npu_prof_ctx = None
-    if args.profile and args.device.startswith("npu"):
-        import torch_npu.profiler
-
-        npu_prof_ctx = torch_npu.profiler.profile(
-            activities=[
-                torch_npu.profiler.ProfilerActivity.CPU,
-                torch_npu.profiler.ProfilerActivity.NPU,
-            ],
-            schedule=torch_npu.profiler.schedule(
-                wait=2, warmup=1, active=2, repeat=1,
-            ),
-            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
-                dir_name="./prof_result",
-                analyse_flag=True,
-            ),
-            record_shapes=True,
-            with_stack=True,
-            with_modules=True,
-            experimental_config=torch_npu.profiler._ExperimentalConfig(
-                profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
-                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
-                l2_cache=True,
-                op_attr=True,
-                data_simplification=True,
-            ),
-        )
-        npu_prof_ctx.__enter__()
-        logging.info("NPU profiler enabled, output: ./prof_result")
 
     for traj_id in args.traj_ids:
         if traj_id < 0 or traj_id >= len(dataset):
@@ -1196,19 +1032,9 @@ def main(args: ArgsConfig):
             action_horizon=args.action_horizon,
             skip_timing_steps=args.skip_timing_steps,
             pipeline_overlap=not args.no_pipeline,
-            npu_prof=npu_prof_ctx,
-            step_start=args.step_start,
         )
         pred_actions.append(pred_action_across_time)
         all_timings.append(timing_dict)  # always record timing (worker needs it for stats)
-
-        # In step-batching worker mode (step_start > 0), pred is partial → eval
-        # dimension mismatch → skip. Per-traj worker (step_start = 0) and normal
-        # mode run evaluate_predictions normally.
-        if is_worker and args.step_start > 0:
-            logging.info(f"[worker] ran {len(pred_action_across_time)} actions, "
-                         f"step_start={args.step_start} → skipping evaluate_predictions")
-            continue
 
         if args.get_performance_stats:
             mse, mae = evaluate_predictions(
@@ -1235,11 +1061,6 @@ def main(args: ArgsConfig):
         raise ValueError(
             f"No valid trajectories to process. Requested IDs {args.traj_ids} are all out of range (dataset has {len(dataset)} trajectories, valid IDs: 0-{len(dataset) - 1})."
         )
-
-    # Close NPU profiler
-    if npu_prof_ctx is not None:
-        npu_prof_ctx.__exit__(None, None, None)
-        logging.info("NPU profiler data saved to ./prof_result")
 
     # Worker mode: save predictions for orchestrator to pick up, then exit.
     if os.environ.get("_GR00T_WORKER") == "1":

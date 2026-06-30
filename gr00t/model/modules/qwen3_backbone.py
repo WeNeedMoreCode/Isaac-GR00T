@@ -376,19 +376,9 @@ class Qwen3Backbone(torch.nn.Module):
         """
         visual = self.model.model.visual
 
-        # Conv3D strategy: replacement (matmul-as-conv3d) is faster than native
-        # Conv3D on every tested NPU (RC 310P1: 1.2ms vs DUO 310P3 native: 31ms).
-        # Default ON for all NPU; override with _GR00T_NATIVE_CONV3D=1 to use native.
-        if getattr(self, '_use_conv3d_replacement', None) is None:
-            if os.environ.get("_GR00T_NATIVE_CONV3D") == "1":
-                self._use_conv3d_replacement = False
-            else:
-                self._use_conv3d_replacement = True
-
-        if self._use_conv3d_replacement:
-            hidden_states = self._conv3d_as_linear(pixel_values, visual.patch_embed.proj)
-        else:
-            hidden_states = visual.patch_embed(pixel_values)
+        # Conv3D replacement (matmul-as-conv3d): faster than native Conv3D on every
+        # tested NPU (RC 310P1: 1.2ms vs DUO 310P3 native: 31ms).
+        hidden_states = self._conv3d_as_linear(pixel_values, visual.patch_embed.proj)
 
         hidden_states = hidden_states + self._cached_visual_pos_embeds.to(
             hidden_states.device, hidden_states.dtype
@@ -416,102 +406,6 @@ class Qwen3Backbone(torch.nn.Module):
 
         hidden_states = visual.merger(hidden_states)
         return hidden_states.squeeze(0), deepstack_feature_lists
-
-    # ------------------------------------------------------------------
-    # Visual encoder sub-functions (for profiled path)
-    # Each is compiled separately so the eager orchestrator below can
-    # time them individually. Production path inlines _compiled_visual_forward
-    # above; profile path calls these 3 sub-functions instead.
-    # ------------------------------------------------------------------
-
-    def _compiled_visual_conv3d(self, pixel_values: torch.Tensor):
-        """Conv3D / patch embed + pos embed add + dtype casts. Compilable."""
-        visual = self.model.model.visual
-
-        # Conv3D strategy: replacement (matmul-as-conv3d) is faster than native
-        # Conv3D on every tested NPU (RC 310P1: 1.2ms vs DUO 310P3 native: 31ms).
-        # Default ON for all NPU; override with _GR00T_NATIVE_CONV3D=1 to use native.
-        if getattr(self, '_use_conv3d_replacement', None) is None:
-            if os.environ.get("_GR00T_NATIVE_CONV3D") == "1":
-                self._use_conv3d_replacement = False
-            else:
-                self._use_conv3d_replacement = True
-
-        if self._use_conv3d_replacement:
-            hidden_states = self._conv3d_as_linear(pixel_values, visual.patch_embed.proj)
-        else:
-            hidden_states = visual.patch_embed(pixel_values)
-
-        hidden_states = hidden_states + self._cached_visual_pos_embeds.to(
-            hidden_states.device, hidden_states.dtype
-        )
-        position_embeddings = (
-            self._cached_visual_pe_cos.to(hidden_states.device, hidden_states.dtype),
-            self._cached_visual_pe_sin.to(hidden_states.device, hidden_states.dtype),
-        )
-        cu_seqlens = self._cached_visual_cu_seqlens.to(hidden_states.device)
-        # Use 3D tensors for better torchair compiled precision
-        hidden_states = hidden_states.unsqueeze(0)
-        return hidden_states, position_embeddings, cu_seqlens
-
-    def _compiled_visual_blocks(self, hidden_states, position_embeddings, cu_seqlens):
-        """16-layer visual transformer + deepstack mergers. Compilable."""
-        visual = self.model.model.visual
-        deepstack_feature_lists = []
-        for layer_num, blk in enumerate(visual.blocks):
-            hidden_states = blk(
-                hidden_states,
-                cu_seqlens=cu_seqlens,
-                position_embeddings=position_embeddings,
-            )
-            if layer_num in visual.deepstack_visual_indexes:
-                idx = visual.deepstack_visual_indexes.index(layer_num)
-                deepstack_feature = visual.deepstack_merger_list[idx](hidden_states.squeeze(0))
-                deepstack_feature_lists.append(deepstack_feature)
-        return hidden_states, deepstack_feature_lists
-
-    def _compiled_visual_merger(self, hidden_states):
-        """Final merger. Compilable."""
-        visual = self.model.model.visual
-        hidden_states = visual.merger(hidden_states)
-        return hidden_states.squeeze(0)
-
-    def _compiled_visual_forward_profiled(self, pixel_values: torch.Tensor):
-        """Eager orchestrator for visual forward with per-stage timing.
-
-        Calls the 3 sub-functions (each separately compiled) so we can see
-        conv3d vs blocks vs merger breakdown.
-        """
-        _sync = getattr(self, '_profile_sync', False)
-
-        # [A] conv3d + pos embed
-        if _sync: torch.npu.synchronize()
-        t0 = time.time()
-        hidden_states, position_embeddings, cu_seqlens = self._compiled_visual_conv3d(pixel_values)
-        if _sync: torch.npu.synchronize()
-        t_conv3d = (time.time() - t0) * 1000
-
-        # [B] 16-layer blocks
-        if _sync: torch.npu.synchronize()
-        t0 = time.time()
-        hidden_states, deepstack_feature_lists = self._compiled_visual_blocks(
-            hidden_states, position_embeddings, cu_seqlens
-        )
-        if _sync: torch.npu.synchronize()
-        t_blocks = (time.time() - t0) * 1000
-
-        # [C] merger
-        if _sync: torch.npu.synchronize()
-        t0 = time.time()
-        hidden_states = self._compiled_visual_merger(hidden_states)
-        if _sync: torch.npu.synchronize()
-        t_merger = (time.time() - t0) * 1000
-
-        logging.info(
-            "[PROF] visual:  conv3d=%.1f  blocks=%.1f  merger=%.1f"
-            % (t_conv3d, t_blocks, t_merger)
-        )
-        return hidden_states, deepstack_feature_lists
 
     def _preprocess_vl_input(self, vl_input: dict) -> dict:
         """Preprocess VL input: text embedding, image encoding, position/mask/RoPE computation.
@@ -566,91 +460,6 @@ class Qwen3Backbone(torch.nn.Module):
             "visual_indices": vl_input["visual_indices"],
         }
 
-    def _preprocess_vl_input_profiled(self, vl_input: dict) -> dict:
-        """Eager twin of _preprocess_vl_input with per-stage timing.
-
-        Used when --instrument is on. Calls _compiled_visual_forward (which must
-        be separately compiled via compile_for_npu) for accurate visual encoder
-        timing; text/mask/rope/scatter run eager.
-
-        Why eager: time.time() cannot be traced by Dynamo inside fullgraph=True
-        compiled functions, so we cannot instrument _preprocess_vl_input itself.
-        """
-        _sync = getattr(self, '_profile_sync', False)
-
-        from transformers.masking_utils import create_causal_mask
-
-        qwen3vl_model = self.model.model
-        lm = self.model.model.language_model
-
-        # 1. Text embedding (eager)
-        if _sync: torch.npu.synchronize()
-        t0 = time.time()
-        inputs_embeds = qwen3vl_model.get_input_embeddings()(vl_input["input_ids"])
-        if _sync: torch.npu.synchronize()
-        t_text = (time.time() - t0) * 1000
-
-        # 2. Visual forward (compiled sub-calls, with internal per-stage timing)
-        if _sync: torch.npu.synchronize()
-        t0 = time.time()
-        pixel_values = vl_input["pixel_values"].to(qwen3vl_model.visual.dtype)
-        raw_embeds, deepstack_image_embeds = self._compiled_visual_forward_profiled(pixel_values)
-        image_embeds = raw_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-        if _sync: torch.npu.synchronize()
-        t_visual = (time.time() - t0) * 1000
-
-        # 3. Causal mask (cached — should be ≈0 after first call)
-        cached_mask = vl_input.get("_cached_causal_mask", None)
-        cached_pos = vl_input.get("_cached_cache_position", None)
-        if cached_mask is not None:
-            causal_mask = cached_mask
-            cache_position = cached_pos
-            t_mask = 0.0
-        else:
-            if _sync: torch.npu.synchronize()
-            t0 = time.time()
-            cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
-            causal_mask = create_causal_mask(
-                config=lm.config,
-                input_embeds=inputs_embeds,
-                attention_mask=vl_input["attention_mask"],
-                cache_position=cache_position,
-                past_key_values=None,
-                position_ids=vl_input["text_position_ids"],
-            )
-            if _sync: torch.npu.synchronize()
-            t_mask = (time.time() - t0) * 1000
-
-        # 4. RoPE embeddings (eager)
-        if _sync: torch.npu.synchronize()
-        t0 = time.time()
-        position_embeddings = lm.rotary_emb(inputs_embeds, vl_input["position_ids"])
-        if _sync: torch.npu.synchronize()
-        t_rope = (time.time() - t0) * 1000
-
-        # 5. Scatter (eager)
-        if _sync: torch.npu.synchronize()
-        t0 = time.time()
-        idx = vl_input["visual_indices"].unsqueeze(0).unsqueeze(-1).expand(1, -1, inputs_embeds.shape[-1])
-        inputs_embeds = inputs_embeds.scatter(1, idx, image_embeds.unsqueeze(0))
-        if _sync: torch.npu.synchronize()
-        t_scatter = (time.time() - t0) * 1000
-
-        logging.info(
-            "[PROF] preprocess:  text=%.1f  visual=%.1f  mask=%.1f  rope=%.1f  scatter=%.1f"
-            % (t_text, t_visual, t_mask, t_rope, t_scatter)
-        )
-
-        return {
-            "inputs_embeds": inputs_embeds,
-            "causal_mask": causal_mask,
-            "text_position_ids": vl_input["text_position_ids"],
-            "cache_position": cache_position,
-            "position_embeddings": position_embeddings,
-            "deepstack_visual_embeds": deepstack_image_embeds,
-            "visual_indices": vl_input["visual_indices"],
-        }
-
     def _language_model_forward(self, **kwargs) -> torch.Tensor:
         """Run the decoder loop only (compilable with torchair).
 
@@ -691,37 +500,19 @@ class Qwen3Backbone(torch.nn.Module):
         return hidden_states
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
-        _prof = getattr(self, '_enable_profiling', False)
-        _sync = getattr(self, '_profile_sync', False) and _prof
-
         # [A] setup: set_frozen + dict + ensure_cache
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t0 = time.time()
         self.set_frozen_modules_to_eval_mode()
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
         self._ensure_visual_cache()
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t_setup = time.time() - t0
 
         # [B] image_mask + nonzero (eager NPU ops, not compiled)
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t0 = time.time()
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
         visual_indices = image_mask[0].nonzero().squeeze(-1)
         vl_input["visual_indices"] = visual_indices
         vl_input["image_mask"] = image_mask
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t_mask = time.time() - t0
 
         # [C] rope_idx
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t0 = time.time()
         qwen3vl_model = self.model.model
         position_ids, _ = qwen3vl_model.get_rope_index(
             vl_input["input_ids"],
@@ -737,17 +528,11 @@ class Qwen3Backbone(torch.nn.Module):
             text_position_ids = position_ids[0]
         vl_input["position_ids"] = position_ids
         vl_input["text_position_ids"] = text_position_ids
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t_rope = time.time() - t0
 
         # [D-mask] causal mask (eager, cached — removed from compiled graph)
         # Cache key includes sequence length S so multi-traj in single process
         # doesn't reuse a mask computed for a different S (would cause shape
         # mismatch in eager_attention_forward).
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t0 = time.time()
         _cur_S = vl_input["input_ids"].shape[1]
         _cached_mask = getattr(self, '_cached_causal_mask', None)
         if _cached_mask is None or _cached_mask.shape[-1] != _cur_S:
@@ -761,54 +546,18 @@ class Qwen3Backbone(torch.nn.Module):
                 past_key_values=None, position_ids=vl_input["text_position_ids"],
             )
             self._cached_cache_position = _cp
-            if _prof:
-                print(f"[PROF] causal_mask computed (S={_cur_S})")
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t_mask_create = time.time() - t0
 
         vl_input["_cached_causal_mask"] = self._cached_causal_mask
         vl_input["_cached_cache_position"] = self._cached_cache_position
 
-        # [D] preprocess (compiled for prod, eager+profiled for --instrument)
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t0 = time.time()
-            lm_kwargs = self._preprocess_vl_input_profiled(vl_input)
-            if _sync: torch.npu.synchronize()
-            t_preprocess = time.time() - t0
-        else:
-            lm_kwargs = self._preprocess_vl_input(vl_input)
+        # [D] preprocess
+        lm_kwargs = self._preprocess_vl_input(vl_input)
 
         # [E] lm (compiled)
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t0 = time.time()
         hidden_states = self._language_model_forward(**lm_kwargs)
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t_lm = time.time() - t0
 
         # [F] output: attention_mask + BatchFeature
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t0 = time.time()
         attention_mask = vl_input["attention_mask"] == 1
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t_output = time.time() - t0
-
-        if _prof:
-            self._prof_step = getattr(self, '_prof_step', 0) + 1
-            if self._prof_step <= 4:
-                print(f"[PROF] backbone:"
-                      f"  setup={t_setup*1000:.1f}"
-                      f"  mask_idx={t_mask*1000:.1f}"
-                      f"  rope={t_rope*1000:.1f}"
-                      f"  mask_create={t_mask_create*1000:.1f}"
-                      f"  preprocess={t_preprocess*1000:.1f}"
-                      f"  lm={t_lm*1000:.1f}"
-                      f"  output={t_output*1000:.1f}")
 
         return BatchFeature(
             data={

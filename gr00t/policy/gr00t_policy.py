@@ -170,13 +170,6 @@ class Gr00tPolicy(BasePolicy):
 
             if compile and _COMPILE_VISUAL_ENCODER:
                 compile_for_npu(model.backbone, "_preprocess_vl_input")
-                # Sub-functions for profiled path (--instrument): each is compiled
-                # separately so the eager orchestrator can time them individually.
-                # Production path inlines _compiled_visual_forward into the
-                # _preprocess_vl_input graph; these are only used for profiling.
-                compile_for_npu(model.backbone, "_compiled_visual_conv3d")
-                compile_for_npu(model.backbone, "_compiled_visual_blocks")
-                compile_for_npu(model.backbone, "_compiled_visual_merger")
             if compile and _COMPILE_LANGUAGE_MODEL:
                 compile_for_npu(model.backbone, "_language_model_forward")
             if compile and _COMPILE_ACTION_HEAD:

@@ -47,7 +47,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
-        self._cached_noise = None  # for _GR00T_CACHE_RANDN optimization
+        self._cached_noise = None  # for cache_randn optimization
 
         if config.use_alternate_vl_dit:
             self.model = AlternateVLDiT(
@@ -337,8 +337,8 @@ class Gr00tN1d7ActionHead(nn.Module):
         device = vl_embeds.device
         # RC device: StatelessRandomNormalV2 runs on aicpu and may fail,
         # generate on CPU then move to device.
-        # _GR00T_CACHE_RANDN=1: first call generates + caches on NPU, subsequent
-        # calls clone the cached tensor (avoids repeated CPU gen + H2D copy).
+        # cache_randn (model attribute): first call generates + caches on NPU,
+        # subsequent calls clone the cached tensor (avoids repeated CPU gen + H2D copy).
         try:
             from npu_utils import _is_rc_device
             _rc = _is_rc_device()
@@ -346,7 +346,7 @@ class Gr00tN1d7ActionHead(nn.Module):
             _rc = False
 
         noise_shape = (batch_size, self.config.action_horizon, self.action_dim)
-        _cache_randn = os.environ.get("_GR00T_CACHE_RANDN") == "1"
+        _cache_randn = getattr(self, '_cache_randn', False)
 
         if _cache_randn and self._cached_noise is not None:
             actions = self._cached_noise.clone()
@@ -614,39 +614,9 @@ class Gr00tN1d7(PreTrainedModel):
         """
         Generate actions using the complete model.
         """
-        _prof = getattr(self, '_enable_profiling', False)
-        _sync = getattr(self, '_profile_sync', False) and _prof
-
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t0 = time.time()
         backbone_inputs, action_inputs = self.prepare_input(inputs)
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t_prepare = time.time() - t0
-
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t0 = time.time()
         backbone_outputs = self.backbone(backbone_inputs)
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t_backbone = time.time() - t0
-
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t0 = time.time()
         action_outputs = self.action_head.get_action(backbone_outputs, action_inputs, options)
-        if _prof:
-            if _sync: torch.npu.synchronize()
-            t_action = time.time() - t0
-
-            self._prof_step = getattr(self, '_prof_step', 0) + 1
-            if self._prof_step <= 4:
-                print(f"[PROF] model: prepare={t_prepare*1000:.1f}ms  "
-                      f"backbone={t_backbone*1000:.1f}ms  action_head={t_action*1000:.1f}ms  "
-                      f"total={(t_prepare+t_backbone+t_action)*1000:.1f}ms")
-
         return action_outputs
 
     @property
