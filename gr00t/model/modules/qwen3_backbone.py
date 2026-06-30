@@ -23,6 +23,8 @@ import torch.nn.functional as F
 import torch_npu
 from transformers.feature_extraction_utils import BatchFeature
 
+from npu_utils import _is_rc_device
+
 
 logger = logging.getLogger(__name__)
 
@@ -236,15 +238,7 @@ class Qwen3Backbone(torch.nn.Module):
             [[1, 16, 16]] * 4, dtype=torch.long, device=visual.patch_embed.proj.weight.device
         )
 
-        # RC device: patch rot_pos_emb to avoid aicpu ops (.max().item(), .prod().sum().item())
-        if getattr(self, '_is_rc', None) is None:
-            try:
-                from npu_utils import _is_rc_device
-                self._is_rc = _is_rc_device()
-            except ImportError:
-                self._is_rc = False
-
-        if self._is_rc:
+        if _is_rc_device():
             _orig_rot_pos_emb = visual.rot_pos_emb
 
             def _rot_pos_emb_cpu_safe(grid_thw_tensor):
@@ -284,17 +278,7 @@ class Qwen3Backbone(torch.nn.Module):
         logger.info("Visual encoder static values cached")
 
     def _patch_visual_attention(self, visual):
-        """Replace Qwen3VLVisionAttention.forward with a reshape-based version.
-
-        The original uses torch.split(lengths.tolist(), dim=2) which creates
-        data-dependent symbolic shapes. We replace it with reshape to static
-        [num_images, num_heads, tokens_per_image, head_dim].
-
-        Uses npu_prompt_flash_attention (PFA) — fused FlashAttention kernel for
-        Ascend inference cards (310P series). ~2.4x faster than explicit
-        matmul+softmax+matmul at [B=4,N=16,S=256,D=128] and eliminates the
-        [B,H,S,S] fp16 intermediate (~8MB at this shape).
-        """
+        """Replace Qwen3VLVisionAttention.forward with a PFA-based reshape version."""
         from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb_vision
 
         num_images = 4

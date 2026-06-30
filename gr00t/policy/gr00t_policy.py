@@ -86,7 +86,6 @@ class Gr00tPolicy(BasePolicy):
         strict: bool = True,
         backbone_path: str | None = None,
         compile: bool = True,
-        nz_cast: bool = True,
     ):
         """Initialize the Gr00t Policy.
 
@@ -161,8 +160,7 @@ class Gr00tPolicy(BasePolicy):
         if is_npu:
             from npu_utils import compile_for_npu, format_cast_to_nz
 
-            if nz_cast:
-                format_cast_to_nz(model)
+            format_cast_to_nz(model)
 
             import gc
             gc.collect()

@@ -32,6 +32,7 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
 )
+from npu_utils import _is_rc_device
 
 
 logger = logging.getLogger(__name__)
@@ -335,22 +336,13 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Set initial actions as the sampled noise.
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
-        # RC device: StatelessRandomNormalV2 runs on aicpu and may fail,
-        # generate on CPU then move to device.
-        # cache_randn (model attribute): first call generates + caches on NPU,
-        # subsequent calls clone the cached tensor (avoids repeated CPU gen + H2D copy).
-        try:
-            from npu_utils import _is_rc_device
-            _rc = _is_rc_device()
-        except ImportError:
-            _rc = False
+        # Generate initial noise; cache for reuse if cache_randn enabled.
+        _rc = _is_rc_device()
 
         noise_shape = (batch_size, self.config.action_horizon, self.action_dim)
         _cache_randn = getattr(self, '_cache_randn', False)
 
-        if _cache_randn and self._cached_noise is not None:
-            actions = self._cached_noise.clone()
-        else:
+        if not self._cached_noise:
             actions = torch.randn(
                 size=noise_shape,
                 dtype=vl_embeds.dtype,
@@ -360,6 +352,8 @@ class Gr00tN1d7ActionHead(nn.Module):
                 actions = actions.to(device)
             if _cache_randn:
                 self._cached_noise = actions.clone()
+        else:
+            actions = self._cached_noise.clone()
 
         dt = 1.0 / self.num_inference_timesteps
         vel_strength = torch.ones_like(actions)

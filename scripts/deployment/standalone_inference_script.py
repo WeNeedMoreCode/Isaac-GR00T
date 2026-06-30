@@ -660,9 +660,6 @@ class ArgsConfig:
     no_compile: bool = False
     """Disable torchair compilation for all stages (visual encoder, language model, action head)."""
 
-    no_nz_cast: bool = False
-    """Skip FRACTAL_NZ weight format conversion (saves peak memory during loading, may slow down eager inference)."""
-
     get_performance_stats: bool = True
     """Agreegate and summarize timing and accuracy stats across several runs"""
 
@@ -937,7 +934,6 @@ def main(args: ArgsConfig):
         device=args.device,
         backbone_path=args.backbone_path,
         compile=not args.no_compile,
-        nz_cast=not args.no_nz_cast,
     )
 
     # Override denoising steps if specified
