@@ -776,7 +776,7 @@ def _orchestrate_per_traj(args: ArgsConfig):
                 continue
             if skip_traj_ids:
                 if a.startswith("-"):
-                    skip_traj_ids = False  # next flag, stop skipping
+                    skip_traj_ids = False
                 else:
                     continue  # still in traj-ids values
             sub_argv.append(a)
