@@ -497,10 +497,6 @@ def run_single_trajectory(
         # causing "event resources are used up" dmesg spam and 0% AICore.
         torch.npu.synchronize()
 
-        # Memory tracking at step boundary
-        # gc.collect()
-        # torch.npu.empty_cache()
-
         # Per-step time printed regardless of skip (helps spot which step is the outlier)
         logging.info(
             f"[TIME] step_idx={step_idx} inference={inference_time*1000:.1f}ms "

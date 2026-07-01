@@ -23,7 +23,7 @@ import torch.nn.functional as F
 import torch_npu
 from transformers.feature_extraction_utils import BatchFeature
 
-from npu_utils import _is_rc_device
+from npu_utils import is_rc_device
 
 
 logger = logging.getLogger(__name__)
@@ -228,7 +228,7 @@ class Qwen3Backbone(torch.nn.Module):
             return
 
         # Apply FFN split4 AFTER model is on NPU (weights already format-converted)
-        if not self._ffn_split4_done and not getattr(self, '_skip_ffn_split4', False):
+        if not self._ffn_split4_done:
             self._apply_ffn_split4()
             self._ffn_split4_done = True
 
@@ -238,7 +238,7 @@ class Qwen3Backbone(torch.nn.Module):
             [[1, 16, 16]] * 4, dtype=torch.long, device=visual.patch_embed.proj.weight.device
         )
 
-        if _is_rc_device():
+        if is_rc_device():
             _orig_rot_pos_emb = visual.rot_pos_emb
 
             def _rot_pos_emb_cpu_safe(grid_thw_tensor):
@@ -360,8 +360,6 @@ class Qwen3Backbone(torch.nn.Module):
         """
         visual = self.model.model.visual
 
-        # Conv3D replacement (matmul-as-conv3d): faster than native Conv3D on every
-        # tested NPU (RC 310P1: 1.2ms vs DUO 310P3 native: 31ms).
         hidden_states = self._conv3d_as_linear(pixel_values, visual.patch_embed.proj)
 
         hidden_states = hidden_states + self._cached_visual_pos_embeds.to(
@@ -484,19 +482,21 @@ class Qwen3Backbone(torch.nn.Module):
         return hidden_states
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
-        # [A] setup: set_frozen + dict + ensure_cache
         self.set_frozen_modules_to_eval_mode()
+        # 0. Set frozen module to eval
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
+
+        # Step 0: Ensure visual cache
         self._ensure_visual_cache()
 
-        # [B] image_mask + nonzero (eager NPU ops, not compiled)
+        # Step 1: Pre-compute non-compilable values
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
         visual_indices = image_mask[0].nonzero().squeeze(-1)
         vl_input["visual_indices"] = visual_indices
         vl_input["image_mask"] = image_mask
 
-        # [C] rope_idx
+        # Step 1b: Position IDs
         qwen3vl_model = self.model.model
         position_ids, _ = qwen3vl_model.get_rope_index(
             vl_input["input_ids"],
@@ -513,10 +513,7 @@ class Qwen3Backbone(torch.nn.Module):
         vl_input["position_ids"] = position_ids
         vl_input["text_position_ids"] = text_position_ids
 
-        # [D-mask] causal mask (eager, cached — removed from compiled graph)
-        # Cache key includes sequence length S so multi-traj in single process
-        # doesn't reuse a mask computed for a different S (would cause shape
-        # mismatch in eager_attention_forward).
+        # Step 1c: Causal mask (cached by sequence length)
         _cur_S = vl_input["input_ids"].shape[1]
         _cached_mask = getattr(self, '_cached_causal_mask', None)
         if _cached_mask is None or _cached_mask.shape[-1] != _cur_S:
@@ -534,13 +531,13 @@ class Qwen3Backbone(torch.nn.Module):
         vl_input["_cached_causal_mask"] = self._cached_causal_mask
         vl_input["_cached_cache_position"] = self._cached_cache_position
 
-        # [D] preprocess
+        # Step 2: Preprocess
         lm_kwargs = self._preprocess_vl_input(vl_input)
 
-        # [E] lm (compiled)
+        # Step 3: Language model
         hidden_states = self._language_model_forward(**lm_kwargs)
 
-        # [F] output: attention_mask + BatchFeature
+        # Step 4: Output processing
         attention_mask = vl_input["attention_mask"] == 1
 
         return BatchFeature(

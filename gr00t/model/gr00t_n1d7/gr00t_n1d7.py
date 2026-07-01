@@ -32,7 +32,7 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
 )
-from npu_utils import _is_rc_device
+from npu_utils import is_rc_device
 
 
 logger = logging.getLogger(__name__)
@@ -337,7 +337,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
         # Generate initial noise; cache for reuse if cache_randn enabled.
-        _rc = _is_rc_device()
+        _rc = is_rc_device()
 
         noise_shape = (batch_size, self.config.action_horizon, self.action_dim)
         _cache_randn = getattr(self, '_cache_randn', False)
